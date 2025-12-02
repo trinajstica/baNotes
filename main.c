@@ -34,6 +34,7 @@ static GtkWidget* create_main_window(void);
 static void create_tray_icon(void);
 static void editor_destroy(GtkWidget *w, gpointer user_data);
 static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeViewColumn *col, gpointer user_data);
+static gboolean on_wrap_label_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data);
 // single-instance socket path
 static char socket_path[4096] = {0};
 static int server_sock = -1;
@@ -277,6 +278,20 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
     GtkWidget *tview = gtk_text_view_new();
     gtk_container_add(GTK_CONTAINER(scroll), tview);
+    /* Label will be inserted into the buttons row; create it now but add later */
+    GtkWidget *wrap_label = gtk_label_new(app_get_word_wrap() ? "Wrap: ON" : "Wrap: OFF");
+    gtk_widget_set_margin_end(wrap_label, 5);
+    /* Wrap label clickable: put in eventbox so it receives pointer events */
+    GtkWidget *wrap_eventbox = gtk_event_box_new();
+    gtk_container_add(GTK_CONTAINER(wrap_eventbox), wrap_label);
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(wrap_eventbox), FALSE);
+    gtk_widget_add_events(wrap_eventbox, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(wrap_eventbox, "button-press-event", G_CALLBACK(on_wrap_label_button_press), NULL);
+    app_register_textview(tview, wrap_label);
+    /* Set word wrap initially from saved settings */
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tview), app_get_word_wrap() ? GTK_WRAP_WORD : GTK_WRAP_NONE);
+    gtk_widget_add_events(tview, GDK_KEY_PRESS_MASK);
+    g_signal_connect(tview, "key-press-event", G_CALLBACK(app_textview_keypress), NULL);
 
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tview));
     // Load content
@@ -298,8 +313,16 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
     gtk_widget_set_margin_bottom(ok, 5);
     gtk_widget_set_margin_end(ok, 5);
     gtk_widget_set_margin_bottom(cancel, 5);
-    gtk_box_pack_end(GTK_BOX(hbox), ok, FALSE, FALSE, 0);
-    gtk_box_pack_end(GTK_BOX(hbox), cancel, FALSE, FALSE, 0);
+    /* Pack buttons on the left */
+    gtk_box_pack_start(GTK_BOX(hbox), ok, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox), cancel, FALSE, FALSE, 0);
+    /* Spacer */
+    GtkWidget *spacer = gtk_label_new(NULL);
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_pack_start(GTK_BOX(hbox), spacer, TRUE, TRUE, 0);
+    /* Wrap label on the right */
+    gtk_widget_set_halign(wrap_eventbox, GTK_ALIGN_END);
+    gtk_box_pack_end(GTK_BOX(hbox), wrap_eventbox, FALSE, FALSE, 0);
 
     // Cancel: just close the window (destroy will free EditorData via editor_destroy)
     g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_widget_destroy), ewin);
@@ -319,6 +342,16 @@ static void editor_destroy(GtkWidget *w, gpointer user_data) {
     if (!ed) return;
     if (ed->title) g_free(ed->title);
     g_free(ed);
+}
+
+// Click handler for wrap label: double-click toggles wrap setting
+static gboolean on_wrap_label_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
+    (void)widget; (void)user_data;
+    if (event->type == GDK_2BUTTON_PRESS && event->button == 1) {
+        app_toggle_word_wrap();
+        return TRUE;
+    }
+    return FALSE;
 }
 
 // Called in main thread via g_idle_add to bring window to front
@@ -512,6 +545,19 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
     GtkWidget *tview = gtk_text_view_new();
     gtk_container_add(GTK_CONTAINER(scroll), tview);
+    /* Label will be placed into the buttons hbox; create it now for registration */
+    GtkWidget *wrap_label = gtk_label_new(app_get_word_wrap() ? "Wrap: ON" : "Wrap: OFF");
+    gtk_widget_set_margin_end(wrap_label, 5);
+    GtkWidget *wrap_eventbox = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(wrap_eventbox), FALSE);
+    gtk_container_add(GTK_CONTAINER(wrap_eventbox), wrap_label);
+    gtk_widget_add_events(wrap_eventbox, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(wrap_eventbox, "button-press-event", G_CALLBACK(on_wrap_label_button_press), NULL);
+    app_register_textview(tview, wrap_label);
+    /* Set word wrap initially from saved settings */
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tview), app_get_word_wrap() ? GTK_WRAP_WORD : GTK_WRAP_NONE);
+    gtk_widget_add_events(tview, GDK_KEY_PRESS_MASK);
+    g_signal_connect(tview, "key-press-event", G_CALLBACK(app_textview_keypress), NULL);
 
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
@@ -522,8 +568,16 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     gtk_widget_set_margin_bottom(ok, 5);
     gtk_widget_set_margin_end(ok, 5);
     gtk_widget_set_margin_bottom(cancel, 5);
-    gtk_box_pack_end(GTK_BOX(hbox), ok, FALSE, FALSE, 0);
-    gtk_box_pack_end(GTK_BOX(hbox), cancel, FALSE, FALSE, 0);
+    /* Pack buttons on the left */
+    gtk_box_pack_start(GTK_BOX(hbox), ok, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox), cancel, FALSE, FALSE, 0);
+    /* Spacer to push wrap label to the right */
+    GtkWidget *spacer = gtk_label_new(NULL);
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_pack_start(GTK_BOX(hbox), spacer, TRUE, TRUE, 0);
+    /* Wrap label on the right */
+    gtk_widget_set_halign(wrap_eventbox, GTK_ALIGN_END);
+    gtk_box_pack_end(GTK_BOX(hbox), wrap_eventbox, FALSE, FALSE, 0);
 
     g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_widget_destroy), dlg);
 
@@ -660,6 +714,13 @@ static void create_tray_icon(void) {
 int main(int argc, char *argv[]) {
     // Ensure config dir exists and prepare socket path
     app_init_config_dirs();
+    // Initialize word-wrap state from saved settings (default enabled)
+    int _wrap_state = 1;
+    if (app_read_word_wrap(&_wrap_state)) {
+        // loaded into internal state by app_read_word_wrap
+    } else {
+        app_save_word_wrap(_wrap_state);
+    }
     const char *home = getenv("HOME");
     if (home) {
         gchar *tmp = g_build_filename(home, CONFIG_DIR, "baNotes.socket", NULL);

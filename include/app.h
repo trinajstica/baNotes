@@ -28,4 +28,25 @@ int app_rename_note(const char *old_title, const char *new_title);
 int app_read_window_position(int *x, int *y);
 void app_save_window_position(int x, int y);
 
+// Word wrap setting persistence
+// Reads the word-wrap setting into *enabled (1 = enabled, 0 = disabled).
+// Returns 1 if setting read successfully, 0 otherwise (e.g. file missing).
+int app_read_word_wrap(int *enabled);
+// Save the word-wrap setting (1 = enabled, 0 = disabled).
+void app_save_word_wrap(int enabled);
+
+// Force update of all registered textviews (wrap mode and labels). Can be called after toggling or on load.
+void app_update_all_textviews_wrap(void);
+// Toggle the global word-wrap setting and update all textviews (also used by UI elements)
+void app_toggle_word_wrap(void);
+
+// Hook for keypress events on textviews: Ctrl+W toggles word-wrap
+gboolean app_textview_keypress(GtkWidget *widget, GdkEventKey *event, gpointer user_data);
+// Return the current word-wrap setting (1 = enabled, 0 = disabled)
+int app_get_word_wrap(void);
+// Register/unregister textviews for global updates;
+// label can be NULL (no status label). Register returns 1 on success.
+int app_register_textview(GtkWidget *tview, GtkWidget *label);
+void app_unregister_textview(GtkWidget *tview);
+
 #endif // APP_H

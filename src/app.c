@@ -32,6 +32,8 @@ GdkPixbuf *app_get_trash_icon(void) {
 #include <dirent.h>
 #include <unistd.h>
 #include <time.h>
+#include <ctype.h>
+#include <gdk/gdkkeysyms.h>
 
 /* settings.conf removed: window position persistence disabled */
 
@@ -45,6 +47,124 @@ static char *get_notes_dir(void) {
     g_free(tmp);
     return path;
 }
+
+static char *get_settings_path(void) {
+    const char *home = getenv("HOME");
+    if (!home) return NULL;
+    gchar *tmp = g_build_filename(home, CONFIG_DIR, "settings.conf", NULL);
+    char *path = g_strdup(tmp);
+    g_free(tmp);
+    return path;
+}
+
+// default enabled
+static int app_word_wrap_enabled = 1;
+
+int app_read_word_wrap(int *enabled) {
+    if (!enabled) return 0;
+    char *path = get_settings_path();
+    if (!path) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) { g_free(path); return 0; }
+    char buf[256];
+    int found = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t l = strlen(buf);
+        while (l > 0 && (buf[l-1] == '\n' || buf[l-1] == '\r')) buf[--l] = '\0';
+        char *s = buf;
+        while (*s && isspace((unsigned char)*s)) s++;
+        if (strncmp(s, "wrap=", 5) == 0) {
+            char *v = s + 5;
+            if (*v == '1') { *enabled = 1; found = 1; break; }
+            else { *enabled = 0; found = 1; break; }
+        }
+    }
+    fclose(f);
+    g_free(path);
+    if (found) app_word_wrap_enabled = *enabled;
+    return found;
+}
+
+void app_save_word_wrap(int enabled) {
+    char *path = get_settings_path();
+    if (!path) return;
+    FILE *f = fopen(path, "w");
+    if (!f) { g_free(path); return; }
+    fprintf(f, "wrap=%d\n", enabled ? 1 : 0);
+    fclose(f);
+    g_free(path);
+    app_word_wrap_enabled = enabled ? 1 : 0;
+}
+
+int app_get_word_wrap(void) { return app_word_wrap_enabled; }
+
+gboolean app_textview_keypress(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
+    (void)user_data;
+    if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_w || event->keyval == GDK_KEY_W)) {
+        app_toggle_word_wrap();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+// Global textview registry to allow updating all open textviews and their labels
+struct tv_entry {
+    GtkWidget *tview;
+    GtkWidget *label; // optional status label
+};
+static GSList *tv_list = NULL;
+
+int app_register_textview(GtkWidget *tview, GtkWidget *label) {
+    if (!tview) return 0;
+    struct tv_entry *e = g_new0(struct tv_entry, 1);
+    e->tview = tview;
+    e->label = label;
+    tv_list = g_slist_append(tv_list, e);
+    // Ensure we clean up when the widget is destroyed
+    g_signal_connect_swapped(tview, "destroy", G_CALLBACK(app_unregister_textview), tview);
+    // Apply current wrap immediately
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tview), app_word_wrap_enabled ? GTK_WRAP_WORD : GTK_WRAP_NONE);
+    if (label) {
+        gtk_label_set_text(GTK_LABEL(label), app_word_wrap_enabled ? "Wrap: ON" : "Wrap: OFF");
+    }
+    return 1;
+}
+
+void app_unregister_textview(GtkWidget *tview) {
+    if (!tview) return;
+    GSList *p = tv_list;
+    while (p) {
+        struct tv_entry *e = (struct tv_entry*)p->data;
+        if (e->tview == tview) {
+            tv_list = g_slist_delete_link(tv_list, p);
+            g_free(e);
+            return;
+        }
+        p = p->next;
+    }
+}
+
+// Update wrap mode for all registered tviews
+void app_update_all_textviews_wrap(void) {
+    GSList *p = tv_list;
+    while (p) {
+        struct tv_entry *e = (struct tv_entry*)p->data;
+        if (GTK_IS_TEXT_VIEW(e->tview)) {
+            gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(e->tview), app_word_wrap_enabled ? GTK_WRAP_WORD : GTK_WRAP_NONE);
+        }
+        if (e->label && GTK_IS_LABEL(e->label)) {
+            gtk_label_set_text(GTK_LABEL(e->label), app_word_wrap_enabled ? "Wrap: ON" : "Wrap: OFF");
+        }
+        p = p->next;
+    }
+}
+
+void app_toggle_word_wrap(void) {
+    app_word_wrap_enabled = !app_word_wrap_enabled;
+    app_save_word_wrap(app_word_wrap_enabled);
+    app_update_all_textviews_wrap();
+}
+// End of wrap functions
 
 void app_init_config_dirs(void) {
     const char *home = getenv("HOME");
