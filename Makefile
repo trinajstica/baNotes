@@ -1,0 +1,74 @@
+CC=gcc
+CFLAGS=`pkg-config --cflags gtk+-3.0 ayatana-appindicator3-0.1` -Iinclude -Wall -g
+LDFLAGS=`pkg-config --libs gtk+-3.0 ayatana-appindicator3-0.1`
+SRC=main.c src/app.c
+OBJ=$(SRC:.c=.o)
+TARGET=baNotes
+
+# Installation paths
+PREFIX ?= /usr/local
+DESTDIR ?=
+BINDIR = $(PREFIX)/bin
+ICONDIR = $(PREFIX)/share/icons/hicolor/128x128/apps
+DESKTOPDIR = $(PREFIX)/share/applications
+ICONTHEME = $(PREFIX)/share/icons/hicolor
+
+all: $(TARGET)
+
+$(TARGET): $(OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJ) $(TARGET)
+
+install: $(TARGET)
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+
+	# Install desktop entry
+	if [ -f baNotes.desktop ]; then \
+		install -d $(DESTDIR)$(DESKTOPDIR); \
+		install -m 0644 baNotes.desktop $(DESTDIR)$(DESKTOPDIR)/baNotes.desktop; \
+	fi
+
+	# Install icon if present
+	if [ -f baNotes.png ]; then \
+		install -d $(DESTDIR)$(ICONDIR); \
+		install -m 0644 baNotes.png $(DESTDIR)$(ICONDIR)/baNotes.png; \
+		# Also install to /usr/share/pixmaps as a fallback for some desktop environments \
+		install -d $(DESTDIR)/usr/share/pixmaps; \
+		install -m 0644 baNotes.png $(DESTDIR)/usr/share/pixmaps/baNotes.png; \
+	fi
+
+	# Update desktop database and icon cache if tools are available
+	if command -v update-desktop-database >/dev/null 2>&1; then \
+		update-desktop-database $(DESTDIR)$(DESKTOPDIR) >/dev/null 2>&1 || true; \
+	fi
+	if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+		gtk-update-icon-cache -f -t $(DESTDIR)$(ICONTHEME) >/dev/null 2>&1 || true; \
+	fi
+
+uninstall:
+	 rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
+	 if [ -f $(DESTDIR)$(DESKTOPDIR)/baNotes.desktop ]; then \
+		rm -f $(DESTDIR)$(DESKTOPDIR)/baNotes.desktop; \
+	fi
+	 if [ -f $(DESTDIR)$(ICONDIR)/baNotes.png ]; then \
+		rm -f $(DESTDIR)$(ICONDIR)/baNotes.png; \
+	fi
+	 if [ -f $(DESTDIR)/usr/share/pixmaps/baNotes.png ]; then \
+		rm -f $(DESTDIR)/usr/share/pixmaps/baNotes.png; \
+	fi
+
+	# Update desktop database and icon cache after uninstall
+	if command -v update-desktop-database >/dev/null 2>&1; then \
+		update-desktop-database $(DESTDIR)$(DESKTOPDIR) >/dev/null 2>&1 || true; \
+	fi
+	if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+		gtk-update-icon-cache -f -t $(DESTDIR)$(ICONTHEME) >/dev/null 2>&1 || true; \
+	fi
+
+.PHONY: all clean install uninstall

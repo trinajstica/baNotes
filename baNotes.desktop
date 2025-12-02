@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=baNotes
+Comment=Simple notes keeper
+Exec=baNotes
+Icon=baNotes
+Terminal=false
+Type=Application
+Categories=Utility;
+StartupWMClass=si.generacija.banotes

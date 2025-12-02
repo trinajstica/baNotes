@@ -1,0 +1,31 @@
+# Ignore build artifacts
+/build/
+/*.o
+/*.so
+/*.a
+*.o
+*.so
+*.a
+
+# Binaries
+/bin/
+
+# Editor temp files
+*~
+*.swp
+*.swo
+
+# Local config
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+
+# Logs and temporary
+*.log
+tmp/
+
+# Installed packaging
+/*.deb
+/*.rpm
