@@ -29,3 +29,6 @@ tmp/
 # Installed packaging
 /*.deb
 /*.rpm
+
+# Ignore compiled application binary
+baNotes
