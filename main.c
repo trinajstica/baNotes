@@ -780,27 +780,84 @@ static void on_insert_text(GtkTextBuffer *buffer, GtkTextIter *location, gchar *
 
 static GtkWidget *create_rich_toolbar_for_editor(EditorData *ed) {
     GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    GtkWidget *tb_b = gtk_toggle_button_new_with_label("B"); gtk_widget_set_tooltip_text(tb_b, "Bold (Ctrl+B)"); g_signal_connect(tb_b, "toggled", G_CALLBACK(on_bold_toggled), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_b, FALSE, FALSE, 0); ed->bold_btn = tb_b;
-    GtkWidget *tb_i = gtk_toggle_button_new_with_label("I"); gtk_widget_set_tooltip_text(tb_i, "Italic (Ctrl+I)"); g_signal_connect(tb_i, "toggled", G_CALLBACK(on_italic_toggled), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_i, FALSE, FALSE, 0); ed->italic_btn = tb_i;
-    GtkWidget *tb_u = gtk_toggle_button_new_with_label("U"); gtk_widget_set_tooltip_text(tb_u, "Underline"); g_signal_connect(tb_u, "toggled", G_CALLBACK(on_underline_toggled), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_u, FALSE, FALSE, 0); ed->underline_btn = tb_u;
-    GtkWidget *tb_fg = gtk_color_button_new(); gtk_widget_set_tooltip_text(tb_fg, "Text color"); g_signal_connect(tb_fg, "color-set", G_CALLBACK(on_fg_color_set), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_fg, FALSE, FALSE, 0);
-    GtkWidget *tb_bg = gtk_color_button_new(); gtk_widget_set_tooltip_text(tb_bg, "Background color"); g_signal_connect(tb_bg, "color-set", G_CALLBACK(on_bg_color_set), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_bg, FALSE, FALSE, 0);
-    /* Clipboard, Undo, Redo buttons */
-    GtkWidget *copy_btn = gtk_button_new_with_label("Copy"); gtk_widget_set_tooltip_text(copy_btn, "Copy selection to editor clipboard"); gtk_box_pack_start(GTK_BOX(toolbar), copy_btn, FALSE, FALSE, 0);
-    GtkWidget *paste_btn = gtk_button_new_with_label("Paste"); gtk_widget_set_tooltip_text(paste_btn, "Paste editor clipboard at cursor"); gtk_box_pack_start(GTK_BOX(toolbar), paste_btn, FALSE, FALSE, 0);
-    GtkWidget *undo_btn = gtk_button_new_with_label("Undo"); gtk_widget_set_tooltip_text(undo_btn, "Undo"); gtk_box_pack_start(GTK_BOX(toolbar), undo_btn, FALSE, FALSE, 0);
-    GtkWidget *redo_btn = gtk_button_new_with_label("Redo"); gtk_widget_set_tooltip_text(redo_btn, "Redo"); gtk_box_pack_start(GTK_BOX(toolbar), redo_btn, FALSE, FALSE, 0);
+    
+    /* Bold toggle with icon */
+    GtkWidget *tb_b = gtk_toggle_button_new();
+    GtkWidget *bold_img = gtk_image_new_from_icon_name("format-text-bold", GTK_ICON_SIZE_BUTTON);
+    gtk_button_set_image(GTK_BUTTON(tb_b), bold_img);
+    gtk_widget_set_tooltip_text(tb_b, "Bold (Ctrl+B)");
+    g_signal_connect(tb_b, "toggled", G_CALLBACK(on_bold_toggled), ed);
+    gtk_box_pack_start(GTK_BOX(toolbar), tb_b, FALSE, FALSE, 0);
+    ed->bold_btn = tb_b;
+    
+    /* Italic toggle with icon */
+    GtkWidget *tb_i = gtk_toggle_button_new();
+    GtkWidget *italic_img = gtk_image_new_from_icon_name("format-text-italic", GTK_ICON_SIZE_BUTTON);
+    gtk_button_set_image(GTK_BUTTON(tb_i), italic_img);
+    gtk_widget_set_tooltip_text(tb_i, "Italic (Ctrl+I)");
+    g_signal_connect(tb_i, "toggled", G_CALLBACK(on_italic_toggled), ed);
+    gtk_box_pack_start(GTK_BOX(toolbar), tb_i, FALSE, FALSE, 0);
+    ed->italic_btn = tb_i;
+    
+    /* Underline toggle with icon */
+    GtkWidget *tb_u = gtk_toggle_button_new();
+    GtkWidget *underline_img = gtk_image_new_from_icon_name("format-text-underline", GTK_ICON_SIZE_BUTTON);
+    gtk_button_set_image(GTK_BUTTON(tb_u), underline_img);
+    gtk_widget_set_tooltip_text(tb_u, "Underline");
+    g_signal_connect(tb_u, "toggled", G_CALLBACK(on_underline_toggled), ed);
+    gtk_box_pack_start(GTK_BOX(toolbar), tb_u, FALSE, FALSE, 0);
+    ed->underline_btn = tb_u;
+    
+    /* Color buttons */
+    GtkWidget *tb_fg = gtk_color_button_new();
+    gtk_widget_set_tooltip_text(tb_fg, "Text color");
+    g_signal_connect(tb_fg, "color-set", G_CALLBACK(on_fg_color_set), ed);
+    gtk_box_pack_start(GTK_BOX(toolbar), tb_fg, FALSE, FALSE, 0);
+    
+    GtkWidget *tb_bg = gtk_color_button_new();
+    gtk_widget_set_tooltip_text(tb_bg, "Background color");
+    g_signal_connect(tb_bg, "color-set", G_CALLBACK(on_bg_color_set), ed);
+    gtk_box_pack_start(GTK_BOX(toolbar), tb_bg, FALSE, FALSE, 0);
+    
+    /* Separator */
+    GtkWidget *sep1 = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
+    gtk_box_pack_start(GTK_BOX(toolbar), sep1, FALSE, FALSE, 2);
+    
+    /* Clipboard buttons with icons */
+    GtkWidget *copy_btn = gtk_button_new_from_icon_name("edit-copy", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(copy_btn, "Copy selection (internal clipboard)");
+    gtk_box_pack_start(GTK_BOX(toolbar), copy_btn, FALSE, FALSE, 0);
+    
+    GtkWidget *paste_btn = gtk_button_new_from_icon_name("edit-paste", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(paste_btn, "Paste from internal clipboard");
+    gtk_box_pack_start(GTK_BOX(toolbar), paste_btn, FALSE, FALSE, 0);
+    
+    /* Separator */
+    GtkWidget *sep2 = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
+    gtk_box_pack_start(GTK_BOX(toolbar), sep2, FALSE, FALSE, 2);
+    
+    /* Undo/Redo buttons with icons */
+    GtkWidget *undo_btn = gtk_button_new_from_icon_name("edit-undo", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(undo_btn, "Undo (Ctrl+Z)");
+    gtk_box_pack_start(GTK_BOX(toolbar), undo_btn, FALSE, FALSE, 0);
+    
+    GtkWidget *redo_btn = gtk_button_new_from_icon_name("edit-redo", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(redo_btn, "Redo (Ctrl+Y)");
+    gtk_box_pack_start(GTK_BOX(toolbar), redo_btn, FALSE, FALSE, 0);
+    
     /* Set initial toggle state from EditorData */
     if (ed) {
         if (ed->bold_mode && ed->bold_btn) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->bold_btn), TRUE);
         if (ed->italic_mode && ed->italic_btn) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->italic_btn), TRUE);
         if (ed->underline_mode && ed->underline_btn) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->underline_btn), TRUE);
     }
-    /* Now that buttons exist, connect them properly for clipboard and history */
+    
+    /* Connect button signals */
     g_signal_connect(copy_btn, "clicked", G_CALLBACK(on_copy_clicked), ed);
     g_signal_connect(paste_btn, "clicked", G_CALLBACK(on_paste_clicked), ed);
     g_signal_connect(undo_btn, "clicked", G_CALLBACK(on_undo_clicked), ed);
     g_signal_connect(redo_btn, "clicked", G_CALLBACK(on_redo_clicked), ed);
+    
     return toolbar;
 }
 

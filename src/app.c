@@ -181,11 +181,11 @@ static GtkTextTag* get_or_create_tag_for_name(GtkTextBuffer *buffer, const char 
     } else if (g_strcmp0(name, "UNDERLINE") == 0) {
         tag = gtk_text_buffer_create_tag(buffer, name, "underline", PANGO_UNDERLINE_SINGLE, NULL);
     } else if (g_str_has_prefix(name, "FG:#")) {
-        const char *color = name + 4;
+        const char *color = name + 3; /* FG: is 3 chars, color includes # */
         tag = gtk_text_buffer_create_tag(buffer, name, "foreground", color, NULL);
         g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
     } else if (g_str_has_prefix(name, "BG:#")) {
-        const char *color = name + 4;
+        const char *color = name + 3; /* BG: is 3 chars, color includes # */
         tag = gtk_text_buffer_create_tag(buffer, name, "background", color, NULL);
         g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
     } else {

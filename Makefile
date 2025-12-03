@@ -10,6 +10,7 @@ PREFIX ?= /usr/local
 DESTDIR ?=
 BINDIR = $(PREFIX)/bin
 ICONDIR = $(PREFIX)/share/icons/hicolor/128x128/apps
+SVGICONDIR = $(PREFIX)/share/icons/hicolor/scalable/apps
 DESKTOPDIR = $(PREFIX)/share/applications
 ICONTHEME = $(PREFIX)/share/icons/hicolor
 
@@ -42,6 +43,12 @@ install: $(TARGET)
 		install -d $(DESTDIR)/usr/share/pixmaps; \
 		install -m 0644 baNotes.png $(DESTDIR)/usr/share/pixmaps/baNotes.png; \
 	fi
+	
+	# Install SVG icon if present
+	if [ -f baNotes.svg ]; then \
+		install -d $(DESTDIR)$(SVGICONDIR); \
+		install -m 0644 baNotes.svg $(DESTDIR)$(SVGICONDIR)/baNotes.svg; \
+	fi
 
 	# Update desktop database and icon cache if tools are available
 	if command -v update-desktop-database >/dev/null 2>&1; then \
@@ -61,6 +68,9 @@ uninstall:
 	fi
 	 if [ -f $(DESTDIR)/usr/share/pixmaps/baNotes.png ]; then \
 		rm -f $(DESTDIR)/usr/share/pixmaps/baNotes.png; \
+	fi
+	 if [ -f $(DESTDIR)$(SVGICONDIR)/baNotes.svg ]; then \
+		rm -f $(DESTDIR)$(SVGICONDIR)/baNotes.svg; \
 	fi
 
 	# Update desktop database and icon cache after uninstall
