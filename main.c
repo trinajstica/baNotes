@@ -762,10 +762,6 @@ static void create_tray_icon(void) {
     }
     app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
     app_indicator_set_menu(indicator, GTK_MENU(menu));
-    /* Set label/title so hover may show application name in some desktop environments */
-    app_indicator_set_label(indicator, "baNotes", NULL);
-
-    /* No GtkStatusIcon fallback to avoid deprecated APIs; AppIndicator is primary. */
 }
 
 int main(int argc, char *argv[]) {
