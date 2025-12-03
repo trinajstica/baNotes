@@ -58,8 +58,9 @@ static void cleanup_socket(void) {
     if (server_sock != -1) close(server_sock);
     if (socket_path[0]) unlink(socket_path);
 }
-static void on_editor_ok_clicked(GtkButton *btn, gpointer user_data);
+static void on_editor_save_clicked(GtkButton *btn, gpointer user_data);
 static char *first_nonempty_line(const char *text);
+static GtkWidget* create_editor_dialog(const char *window_title, const char *note_title, GtkTextBuffer *existing_buffer);
 
 // Editor data
 typedef struct EditorData EditorData;
@@ -232,7 +233,7 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
 }
 
 // Save the edited note when the "OK" button is clicked
-static void on_editor_ok_clicked(GtkButton *btn, gpointer user_data) {
+static void on_editor_save_clicked(GtkButton *btn, gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
     if (!ed) return;
         GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ed->tview));
@@ -417,101 +418,26 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
     GtkTreeIter iter;
     if (!gtk_tree_model_get_iter(model, &iter, path)) return;
     gchar *title = NULL;
-        gtk_tree_model_get(model, &iter, 0, &title, -1);
+    gtk_tree_model_get(model, &iter, 0, &title, -1);
     if (!title) return;
 
-    // Create editor window (save on 'OK', 'Cancel' discards changes)
-    GtkWidget *ewin = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    char wtitle[512];
-    snprintf(wtitle, sizeof(wtitle), "Edit: %s", title);
-    gtk_window_set_title(GTK_WINDOW(ewin), wtitle);
-    gtk_window_set_default_size(GTK_WINDOW(ewin), 600, 400);
-    gtk_window_set_transient_for(GTK_WINDOW(ewin), GTK_WINDOW(main_window));
-    gtk_window_set_position(GTK_WINDOW(ewin), GTK_WIN_POS_CENTER_ON_PARENT);
-
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_container_add(GTK_CONTAINER(ewin), vbox);
-    gtk_widget_set_margin_start(vbox, 5);
-    gtk_widget_set_margin_end(vbox, 5);
-
-    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
-    GtkWidget *tview = gtk_text_view_new();
-    gtk_container_add(GTK_CONTAINER(scroll), tview);
-    /* Label will be inserted into the buttons row; create it now but add later */
-    GtkWidget *wrap_label = gtk_label_new(app_get_word_wrap() ? "Wrap: ON" : "Wrap: OFF");
-    gtk_widget_set_margin_end(wrap_label, 5);
-    /* Wrap label clickable: put in eventbox so it receives pointer events */
-    GtkWidget *wrap_eventbox = gtk_event_box_new();
-    gtk_container_add(GTK_CONTAINER(wrap_eventbox), wrap_label);
-    gtk_event_box_set_visible_window(GTK_EVENT_BOX(wrap_eventbox), FALSE);
-    gtk_widget_add_events(wrap_eventbox, GDK_BUTTON_PRESS_MASK);
-    g_signal_connect(wrap_eventbox, "button-press-event", G_CALLBACK(on_wrap_label_button_press), NULL);
-    app_register_textview(tview, wrap_label);
-    /* Set word wrap initially from saved settings */
-    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tview), app_get_word_wrap() ? GTK_WRAP_WORD : GTK_WRAP_NONE);
-    gtk_widget_add_events(tview, GDK_KEY_PRESS_MASK);
-    g_signal_connect(tview, "key-press-event", G_CALLBACK(app_textview_keypress), NULL);
-    /* rich keypress handler will be connected after EditorData is created */
-    /* rich keypress handler connects directly to the buffer (via gtk_text_view_get_buffer) */
-
-    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tview));
-    // Load content into buffer (with potential rich parsing)
+    /* Create buffer and load note content */
+    GtkTextBuffer *buffer = gtk_text_buffer_new(NULL);
     app_load_note_into_buffer(title, buffer);
 
-    EditorData *ed = g_new0(EditorData, 1);
-    ed->title = g_strdup(title);
-    ed->buffer = buffer;
-    ed->window = ewin;
-    ed->tview = tview;
-    ed->bold_mode = ed->italic_mode = ed->underline_mode = FALSE;
-    ed->fg_color = NULL; ed->bg_color = NULL;
-    ed->undo_stack = NULL; ed->redo_stack = NULL; ed->max_history = 128; ed->ignore_changes = FALSE;
-    ed->debounce_timer = 0;
-    /* initial snapshot for add dialog */
-    editor_push_snapshot(ed);
-    ed->undo_stack = NULL; ed->redo_stack = NULL; ed->max_history = 128; ed->ignore_changes = FALSE;
-    ed->debounce_timer = 0;
-    // Save initial snapshot for undo
-    editor_push_snapshot(ed);
+    /* Create editor dialog with loaded content */
+    char window_title[512];
+    snprintf(window_title, sizeof(window_title), "Edit: %s", title);
+    GtkWidget *dlg = create_editor_dialog(window_title, title, buffer);
+    
+    /* Get EditorData and Save button from dialog */
+    EditorData *ed = (EditorData*)g_object_get_data(G_OBJECT(dlg), "editor-data");
+    GtkWidget *save_btn = (GtkWidget*)g_object_get_data(G_OBJECT(dlg), "save-button");
+    
+    /* Connect save button */
+    g_signal_connect(save_btn, "clicked", G_CALLBACK(on_editor_save_clicked), ed);
 
-    // Add simple rich-text toolbar above buttons
-    GtkWidget *toolbar = create_rich_toolbar_for_editor(ed);
-    gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
-
-    // Add OK / Cancel buttons
-    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
-    GtkWidget *ok = gtk_button_new_with_label("Ok");
-    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
-    /* Ensure consistent spacing: OK has 5px bottom + 5px right; Cancel has 5px bottom */
-    gtk_widget_set_margin_bottom(ok, 5);
-    gtk_widget_set_margin_end(ok, 5);
-    gtk_widget_set_margin_bottom(cancel, 5);
-    /* Pack buttons on the left */
-    gtk_box_pack_start(GTK_BOX(hbox), ok, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(hbox), cancel, FALSE, FALSE, 0);
-    /* Spacer */
-    GtkWidget *spacer = gtk_label_new(NULL);
-    gtk_widget_set_hexpand(spacer, TRUE);
-    gtk_box_pack_start(GTK_BOX(hbox), spacer, TRUE, TRUE, 0);
-    /* Wrap label on the right */
-    gtk_widget_set_halign(wrap_eventbox, GTK_ALIGN_END);
-    gtk_box_pack_end(GTK_BOX(hbox), wrap_eventbox, FALSE, FALSE, 0);
-
-    // Cancel: just close the window (destroy will free EditorData via editor_destroy)
-    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_widget_destroy), ewin);
-
-    // OK: save (respect existing file names — check collisions)
-    // connect insert-text to handle typed characters
-    g_signal_connect(ed->buffer, "insert-text", G_CALLBACK(on_insert_text), ed);
-    // connect rich keypress handler now that EditorData and buttons exist
-    g_signal_connect(tview, "key-press-event", G_CALLBACK(on_textview_keypress_rich), ed);
-    g_signal_connect(ok, "clicked", G_CALLBACK(on_editor_ok_clicked), ed);
-
-    g_signal_connect(ewin, "destroy", G_CALLBACK(editor_destroy), ed);
-
-    gtk_widget_show_all(ewin);
+    gtk_widget_show_all(dlg);
     g_free(title);
 }
 
@@ -703,6 +629,35 @@ static void on_paste_clicked(GtkButton *btn, gpointer user_data) { editor_paste_
 static void on_undo_clicked(GtkButton *btn, gpointer user_data) { editor_undo((EditorData*)user_data); }
 static void on_redo_clicked(GtkButton *btn, gpointer user_data) { editor_redo((EditorData*)user_data); }
 
+static void on_clear_formatting_clicked(GtkButton *btn, gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    if (!ed) return;
+    /* Turn off all formatting modes */
+    ed->bold_mode = FALSE;
+    ed->italic_mode = FALSE;
+    ed->underline_mode = FALSE;
+    if (ed->fg_color) { g_free(ed->fg_color); ed->fg_color = NULL; }
+    if (ed->bg_color) { g_free(ed->bg_color); ed->bg_color = NULL; }
+    /* Update toggle button states */
+    if (ed->bold_btn) {
+        g_signal_handlers_block_by_func(ed->bold_btn, G_CALLBACK(on_bold_toggled), ed);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->bold_btn), FALSE);
+        g_signal_handlers_unblock_by_func(ed->bold_btn, G_CALLBACK(on_bold_toggled), ed);
+    }
+    if (ed->italic_btn) {
+        g_signal_handlers_block_by_func(ed->italic_btn, G_CALLBACK(on_italic_toggled), ed);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->italic_btn), FALSE);
+        g_signal_handlers_unblock_by_func(ed->italic_btn, G_CALLBACK(on_italic_toggled), ed);
+    }
+    if (ed->underline_btn) {
+        g_signal_handlers_block_by_func(ed->underline_btn, G_CALLBACK(on_underline_toggled), ed);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->underline_btn), FALSE);
+        g_signal_handlers_unblock_by_func(ed->underline_btn, G_CALLBACK(on_underline_toggled), ed);
+    }
+    /* Return focus to editor */
+    if (ed->tview) gtk_widget_grab_focus(ed->tview);
+}
+
 static gboolean on_textview_keypress_rich(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
     /* user_data is EditorData* */
     EditorData *ed = (EditorData*)user_data;
@@ -819,6 +774,12 @@ static GtkWidget *create_rich_toolbar_for_editor(EditorData *ed) {
     g_signal_connect(tb_bg, "color-set", G_CALLBACK(on_bg_color_set), ed);
     gtk_box_pack_start(GTK_BOX(toolbar), tb_bg, FALSE, FALSE, 0);
     
+    /* Clear formatting button */
+    GtkWidget *clear_fmt_btn = gtk_button_new_from_icon_name("edit-clear", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(clear_fmt_btn, "Clear formatting (reset to plain text)");
+    g_signal_connect(clear_fmt_btn, "clicked", G_CALLBACK(on_clear_formatting_clicked), ed);
+    gtk_box_pack_start(GTK_BOX(toolbar), clear_fmt_btn, FALSE, FALSE, 0);
+    
     /* Separator */
     GtkWidget *sep1 = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
     gtk_box_pack_start(GTK_BOX(toolbar), sep1, FALSE, FALSE, 2);
@@ -911,7 +872,7 @@ static void on_show_hide(GtkMenuItem *item, gpointer user_data) {
         if (app_read_window_position(&x, &y) && x >= 0 && y >= 0) {
             gtk_window_move(GTK_WINDOW(main_window), x, y);
         }
-        app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
+        /* app_load_notes will be called by focus-in-event handler */
         gtk_widget_show_all(main_window);
         /* Select first note row after loading notes */
         select_first_note_row();
@@ -969,6 +930,87 @@ static char *first_nonempty_line(const char *text) {
     return NULL;
 }
 
+/* 
+ * Create a shared editor dialog window for both add and edit operations.
+ * Returns the dialog window. EditorData is attached to window as "editor-data".
+ * Save button is attached as "save-button" for caller to connect signal.
+ */
+static GtkWidget* create_editor_dialog(const char *window_title, const char *note_title, GtkTextBuffer *existing_buffer) {
+    GtkWidget *dlg = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(dlg), window_title);
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 600, 400);
+    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(main_window));
+    gtk_window_set_position(GTK_WINDOW(dlg), GTK_WIN_POS_CENTER_ON_PARENT);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_add(GTK_CONTAINER(dlg), vbox);
+    gtk_widget_set_margin_start(vbox, 5);
+    gtk_widget_set_margin_end(vbox, 5);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
+    GtkWidget *tview = gtk_text_view_new();
+    gtk_container_add(GTK_CONTAINER(scroll), tview);
+    
+    GtkWidget *wrap_label = gtk_label_new(app_get_word_wrap() ? "Wrap: ON" : "Wrap: OFF");
+    gtk_widget_set_margin_end(wrap_label, 5);
+    GtkWidget *wrap_eventbox = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(wrap_eventbox), FALSE);
+    gtk_container_add(GTK_CONTAINER(wrap_eventbox), wrap_label);
+    gtk_widget_add_events(wrap_eventbox, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(wrap_eventbox, "button-press-event", G_CALLBACK(on_wrap_label_button_press), NULL);
+    app_register_textview(tview, wrap_label);
+    
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tview), app_get_word_wrap() ? GTK_WRAP_WORD : GTK_WRAP_NONE);
+    gtk_widget_add_events(tview, GDK_KEY_PRESS_MASK);
+    g_signal_connect(tview, "key-press-event", G_CALLBACK(app_textview_keypress), NULL);
+
+    GtkTextBuffer *buffer = existing_buffer ? existing_buffer : gtk_text_view_get_buffer(GTK_TEXT_VIEW(tview));
+    if (existing_buffer) {
+        gtk_text_view_set_buffer(GTK_TEXT_VIEW(tview), existing_buffer);
+    }
+    
+    EditorData *ed = g_new0(EditorData, 1);
+    ed->title = note_title ? g_strdup(note_title) : NULL;
+    ed->buffer = buffer;
+    ed->window = dlg;
+    ed->tview = tview;
+    ed->bold_mode = ed->italic_mode = ed->underline_mode = FALSE;
+    ed->fg_color = NULL; ed->bg_color = NULL;
+    ed->undo_stack = NULL; ed->redo_stack = NULL; ed->max_history = 128; ed->ignore_changes = FALSE;
+    ed->debounce_timer = 0;
+    g_object_set_data(G_OBJECT(dlg), "editor-data", ed);
+    editor_push_snapshot(ed);
+
+    GtkWidget *toolbar = create_rich_toolbar_for_editor(ed);
+    gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
+
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
+
+    GtkWidget *save_btn = gtk_button_new_with_label("Save");
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
+    gtk_widget_set_margin_bottom(save_btn, 5);
+    gtk_widget_set_margin_end(save_btn, 5);
+    gtk_widget_set_margin_bottom(cancel, 5);
+    gtk_box_pack_start(GTK_BOX(hbox), save_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox), cancel, FALSE, FALSE, 0);
+    
+    GtkWidget *spacer = gtk_label_new(NULL);
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_pack_start(GTK_BOX(hbox), spacer, TRUE, TRUE, 0);
+    gtk_widget_set_halign(wrap_eventbox, GTK_ALIGN_END);
+    gtk_box_pack_end(GTK_BOX(hbox), wrap_eventbox, FALSE, FALSE, 0);
+
+    g_object_set_data(G_OBJECT(dlg), "save-button", save_btn);
+    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_widget_destroy), dlg);
+    g_signal_connect(tview, "key-press-event", G_CALLBACK(on_textview_keypress_rich), ed);
+    g_signal_connect(dlg, "destroy", G_CALLBACK(editor_destroy), ed);
+    g_signal_connect(ed->buffer, "insert-text", G_CALLBACK(on_insert_text), ed);
+
+    return dlg;
+}
+
 /* Select the first row in the notes tree view, if present */
 static void select_first_note_row(void) {
     if (tree && notes_store) {
@@ -984,16 +1026,10 @@ static void select_first_note_row(void) {
         }
     }
 }
-
-typedef struct {
-    GtkWindow *dlg;
-    GtkWidget *tview;
-} NewNoteData;
-
-static void on_add_ok_clicked(GtkButton *btn, gpointer user_data) {
-    NewNoteData *nd = (NewNoteData*)user_data;
-    if (!nd) return;
-    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(nd->tview));
+static void on_add_save_clicked(GtkButton *btn, gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    if (!ed) return;
+    GtkTextBuffer *buf = ed->buffer;
     GtkTextIter start, end;
     gtk_text_buffer_get_start_iter(buf, &start);
     gtk_text_buffer_get_end_iter(buf, &end);
@@ -1066,87 +1102,22 @@ static void on_add_ok_clicked(GtkButton *btn, gpointer user_data) {
     }
     if (first) g_free(first);
     g_free(text);
-    gtk_widget_destroy(GTK_WIDGET(nd->dlg));
-    g_free(nd);
+
+    /* Close the dialog (editor_destroy will free EditorData) */
+    gtk_widget_destroy(ed->window);
 }
 
 // Handler: '+' button for new note
 static void on_add_clicked(GtkButton *btn, gpointer user_data) {
-    GtkWidget *dlg = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(dlg), "New note");
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 600, 400);
-    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(main_window));
-    gtk_window_set_position(GTK_WINDOW(dlg), GTK_WIN_POS_CENTER_ON_PARENT);
-
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_container_add(GTK_CONTAINER(dlg), vbox);
-    gtk_widget_set_margin_start(vbox, 5);
-    gtk_widget_set_margin_end(vbox, 5);
-
-    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
-    GtkWidget *tview = gtk_text_view_new();
-    gtk_container_add(GTK_CONTAINER(scroll), tview);
-    /* Label will be placed into the buttons hbox; create it now for registration */
-    GtkWidget *wrap_label = gtk_label_new(app_get_word_wrap() ? "Wrap: ON" : "Wrap: OFF");
-    gtk_widget_set_margin_end(wrap_label, 5);
-    GtkWidget *wrap_eventbox = gtk_event_box_new();
-    gtk_event_box_set_visible_window(GTK_EVENT_BOX(wrap_eventbox), FALSE);
-    gtk_container_add(GTK_CONTAINER(wrap_eventbox), wrap_label);
-    gtk_widget_add_events(wrap_eventbox, GDK_BUTTON_PRESS_MASK);
-    g_signal_connect(wrap_eventbox, "button-press-event", G_CALLBACK(on_wrap_label_button_press), NULL);
-    app_register_textview(tview, wrap_label);
-    /* Set word wrap initially from saved settings */
-    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tview), app_get_word_wrap() ? GTK_WRAP_WORD : GTK_WRAP_NONE);
-    gtk_widget_add_events(tview, GDK_KEY_PRESS_MASK);
-    g_signal_connect(tview, "key-press-event", G_CALLBACK(app_textview_keypress), NULL);
-
-    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
-
-    GtkWidget *ok = gtk_button_new_with_label("Ok");
-    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
-    /* Ensure consistent spacing: OK has 5px bottom + 5px right; Cancel has 5px bottom */
-    gtk_widget_set_margin_bottom(ok, 5);
-    gtk_widget_set_margin_end(ok, 5);
-    gtk_widget_set_margin_bottom(cancel, 5);
-    /* Pack buttons on the left */
-    gtk_box_pack_start(GTK_BOX(hbox), ok, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(hbox), cancel, FALSE, FALSE, 0);
-    /* Spacer to push wrap label to the right */
-    GtkWidget *spacer = gtk_label_new(NULL);
-    gtk_widget_set_hexpand(spacer, TRUE);
-    gtk_box_pack_start(GTK_BOX(hbox), spacer, TRUE, TRUE, 0);
-    /* Wrap label on the right */
-    gtk_widget_set_halign(wrap_eventbox, GTK_ALIGN_END);
-    gtk_box_pack_end(GTK_BOX(hbox), wrap_eventbox, FALSE, FALSE, 0);
-
-    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_widget_destroy), dlg);
-
-    NewNoteData *nd = g_new0(NewNoteData, 1);
-    nd->dlg = GTK_WINDOW(dlg);
-    nd->tview = tview;
-    /* Create an EditorData for the new note so toolbar behavior and insert-text work the same */
-    EditorData *ed = g_new0(EditorData, 1);
-    ed->title = NULL;
-    ed->buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tview));
-    ed->window = dlg;
-    ed->tview = tview;
-    ed->bold_mode = ed->italic_mode = ed->underline_mode = FALSE;
-    ed->fg_color = NULL; ed->bg_color = NULL;
-    nd->tview = tview;
-    /* Attach EditorData pointer to dlg so we can free later in destroy */
-    g_object_set_data(G_OBJECT(dlg), "editor-data", ed);
-
-    g_signal_connect(ok, "clicked", G_CALLBACK(on_add_ok_clicked), nd);
-    /* Add a toolbar for the new note that uses our EditorData */
-    GtkWidget *toolbar2 = create_rich_toolbar_for_editor(ed);
-    gtk_box_pack_start(GTK_BOX(vbox), toolbar2, FALSE, FALSE, 0);
-    /* register textview and insert-text handler */
-    app_register_textview(tview, wrap_label);
-    g_signal_connect(tview, "key-press-event", G_CALLBACK(on_textview_keypress_rich), ed);
-    g_signal_connect(dlg, "destroy", G_CALLBACK(editor_destroy), ed);
-    g_signal_connect(ed->buffer, "insert-text", G_CALLBACK(on_insert_text), ed);
+    /* Create editor dialog for new note (no title, empty buffer) */
+    GtkWidget *dlg = create_editor_dialog("New note", NULL, NULL);
+    
+    /* Get EditorData and Save button from dialog */
+    EditorData *ed = (EditorData*)g_object_get_data(G_OBJECT(dlg), "editor-data");
+    GtkWidget *save_btn = (GtkWidget*)g_object_get_data(G_OBJECT(dlg), "save-button");
+    
+    /* Connect save button to add save callback */
+    g_signal_connect(save_btn, "clicked", G_CALLBACK(on_add_save_clicked), ed);
 
     gtk_widget_show_all(dlg);
 }
@@ -1159,11 +1130,20 @@ static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer us
     return TRUE; // prepreči uničenje
 }
 
+static gboolean on_window_focus_in(GtkWidget *widget, GdkEventFocus *event, gpointer user_data) {
+    /* Reload notes list when main window gains focus */
+    if (notes_store && search_entry) {
+        app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
+    }
+    return FALSE; /* propagate event */
+}
+
 static GtkWidget* create_main_window(void) {
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), "baNotes");
     gtk_window_set_default_size(GTK_WINDOW(win), 500, 600);
     g_signal_connect(win, "delete-event", G_CALLBACK(on_window_delete), NULL);
+    g_signal_connect(win, "focus-in-event", G_CALLBACK(on_window_focus_in), NULL);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_container_add(GTK_CONTAINER(win), vbox);
