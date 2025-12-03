@@ -42,6 +42,7 @@ static int server_sock = -1;
 // Forward
 static void *instance_server_thread(void *arg);
 static gboolean bring_main_window(gpointer user_data);
+static void select_first_note_row(void);
 
 static void cleanup_socket(void) {
     if (server_sock != -1) close(server_sock);
@@ -410,6 +411,8 @@ static gboolean on_wrap_label_button_press(GtkWidget *widget, GdkEventButton *ev
 static gboolean bring_main_window(gpointer user_data) {
     if (main_window) {
         if (!gtk_widget_get_visible(main_window)) gtk_widget_show_all(main_window);
+        /* Select first note row when window is shown */
+        select_first_note_row();
         gtk_window_present(GTK_WINDOW(main_window));
     }
     return FALSE; // run once
@@ -446,6 +449,8 @@ static void on_show_hide(GtkMenuItem *item, gpointer user_data) {
         }
         app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
         gtk_widget_show_all(main_window);
+        /* Select first note row after loading notes */
+        select_first_note_row();
         // Bring to front and focus
         gtk_window_present(GTK_WINDOW(main_window));
         gtk_widget_grab_focus(main_window);
@@ -474,6 +479,8 @@ static void on_clear_clicked(GtkButton *btn, gpointer user_data) {
             gtk_tree_selection_select_path(sel, path);
             gtk_tree_view_set_cursor(GTK_TREE_VIEW(tree), path, NULL, FALSE);
             gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(tree), path, NULL, TRUE, 0.5, 0.0);
+            /* Give focus to the tree so keyboard navigation works */
+            gtk_widget_grab_focus(tree);
             gtk_tree_path_free(path);
         }
     }
@@ -496,6 +503,22 @@ static char *first_nonempty_line(const char *text) {
         p = e + 1;
     }
     return NULL;
+}
+
+/* Select the first row in the notes tree view, if present */
+static void select_first_note_row(void) {
+    if (tree && notes_store) {
+        GtkTreeModel *model = GTK_TREE_MODEL(notes_store);
+        GtkTreeIter iter;
+        if (gtk_tree_model_get_iter_first(model, &iter)) {
+            GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+            GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+            gtk_tree_selection_select_path(sel, path);
+            gtk_tree_view_set_cursor(GTK_TREE_VIEW(tree), path, NULL, FALSE);
+            gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(tree), path, NULL, TRUE, 0.5, 0.0);
+            gtk_tree_path_free(path);
+        }
+    }
 }
 
 typedef struct {
@@ -653,7 +676,7 @@ static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer us
 static GtkWidget* create_main_window(void) {
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), "baNotes");
-    gtk_window_set_default_size(GTK_WINDOW(win), 400, 600);
+    gtk_window_set_default_size(GTK_WINDOW(win), 500, 600);
     g_signal_connect(win, "delete-event", G_CALLBACK(on_window_delete), NULL);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
@@ -711,6 +734,9 @@ static GtkWidget* create_main_window(void) {
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_container_add(GTK_CONTAINER(scroll), tree);
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
+
+    /* Make sure first row is selected when the main window appears */
+    select_first_note_row();
 
     return win;
 }
