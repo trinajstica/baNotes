@@ -19,7 +19,7 @@ sudo make install
 
 Usage
 
-- Run `baNotes` after installation or start from your desktop environment. The app stores notes as simple `.txt` files.
+- Run `baNotes` after installation or start from your desktop environment. The app stores notes in `.txt` files located in a user configuration directory. Files are either plain text or encoded in the BA-RICH-V1 "enriched" format (used to persist editor formatting).
 
 License
 
