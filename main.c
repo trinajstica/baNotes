@@ -82,6 +82,7 @@ struct EditorData {
     GList *redo_stack; // list of char* snapshots
     int max_history;
     gboolean ignore_changes;
+    guint debounce_timer; /* timer id for grouping keypress snapshots */
 };
 
 static char *sanitize_title(const char *s) {
@@ -358,6 +359,27 @@ static void editor_push_snapshot(EditorData *ed) {
     ed->redo_stack = NULL;
 }
 
+/* Debounce timer callback: push snapshot and clear timer id */
+static gboolean editor_debounce_snapshot_cb(gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    if (!ed) return G_SOURCE_REMOVE;
+    ed->debounce_timer = 0;
+    editor_push_snapshot(ed);
+    return G_SOURCE_REMOVE;
+}
+
+/* Schedule a snapshot push using debounce timer (500ms). If a timer exists, reset it. */
+static void editor_schedule_snapshot(EditorData *ed) {
+    if (!ed) return;
+    /* If a timer is already scheduled, remove it */
+    if (ed->debounce_timer) {
+        g_source_remove(ed->debounce_timer);
+        ed->debounce_timer = 0;
+    }
+    /* Schedule new timer */
+    ed->debounce_timer = g_timeout_add(500, editor_debounce_snapshot_cb, ed);
+}
+
 // Apply a snapshot string into editor buffer
 static void editor_apply_snapshot(EditorData *ed, const char *snap) {
     if (!ed || !snap) return;
@@ -445,9 +467,11 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
     ed->bold_mode = ed->italic_mode = ed->underline_mode = FALSE;
     ed->fg_color = NULL; ed->bg_color = NULL;
     ed->undo_stack = NULL; ed->redo_stack = NULL; ed->max_history = 128; ed->ignore_changes = FALSE;
+    ed->debounce_timer = 0;
     /* initial snapshot for add dialog */
     editor_push_snapshot(ed);
     ed->undo_stack = NULL; ed->redo_stack = NULL; ed->max_history = 128; ed->ignore_changes = FALSE;
+    ed->debounce_timer = 0;
     // Save initial snapshot for undo
     editor_push_snapshot(ed);
 
@@ -494,6 +518,7 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
 static void editor_destroy(GtkWidget *w, gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
     if (!ed) return;
+    if (ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
     if (ed->title) g_free(ed->title);
     if (ed->fg_color) g_free(ed->fg_color);
     if (ed->bg_color) g_free(ed->bg_color);
@@ -525,7 +550,8 @@ static void editor_paste_from_clipboard(EditorData *ed) {
     GtkTextIter it;
     GtkTextMark *m = gtk_text_buffer_get_insert(ed->buffer);
     gtk_text_buffer_get_iter_at_mark(ed->buffer, &it, m);
-    // Save snapshot before pasting
+    // Save snapshot before pasting. Cancel pending debounced snapshot if any.
+    if (ed && ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
     editor_push_snapshot(ed);
     gtk_text_buffer_insert(ed->buffer, &it, clip, -1);
 }
@@ -580,6 +606,7 @@ static void on_bold_toggled(GtkToggleButton *btn, gpointer user_data) {
     GtkTextIter s,e; gboolean sel = FALSE;
     if (ed && ed->buffer) sel = gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e);
     if (sel) {
+        if (ed && ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
         editor_push_snapshot(ed);
         editor_apply_tag_on_selection(ed, "BOLD", active);
         /* switch mode off after applying */
@@ -598,6 +625,7 @@ static void on_italic_toggled(GtkToggleButton *btn, gpointer user_data) {
     GtkTextIter s,e; gboolean sel = FALSE;
     if (ed && ed->buffer) sel = gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e);
     if (sel) {
+        if (ed && ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
         editor_push_snapshot(ed);
         editor_apply_tag_on_selection(ed, "ITALIC", active);
         ed->italic_mode = FALSE;
@@ -615,6 +643,7 @@ static void on_underline_toggled(GtkToggleButton *btn, gpointer user_data) {
     GtkTextIter s,e; gboolean sel = FALSE;
     if (ed && ed->buffer) sel = gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e);
     if (sel) {
+        if (ed && ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
         editor_push_snapshot(ed);
         editor_apply_tag_on_selection(ed, "UNDERLINE", active);
         ed->underline_mode = FALSE;
@@ -637,6 +666,7 @@ static void on_fg_color_set(GtkColorButton *cbtn, gpointer user_data) {
     if (ed && ed->buffer) {
         char name[64]; snprintf(name, sizeof(name), "FG:#%02x%02x%02x", (int)(color.red*255), (int)(color.green*255), (int)(color.blue*255));
         GtkTextIter s,e; if (gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e)) {
+            if (ed && ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
             editor_push_snapshot(ed);
             GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, name);
             gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e);
@@ -656,6 +686,7 @@ static void on_bg_color_set(GtkColorButton *cbtn, gpointer user_data) {
     if (ed && ed->buffer) {
         char name[64]; snprintf(name, sizeof(name), "BG:#%02x%02x%02x", (int)(color.red*255), (int)(color.green*255), (int)(color.blue*255));
         GtkTextIter s,e; if (gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e)) {
+            if (ed && ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
             editor_push_snapshot(ed);
             GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, name);
             gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e);
@@ -689,19 +720,22 @@ static gboolean on_textview_keypress_rich(GtkWidget *widget, GdkEventKey *event,
         }
         return TRUE;
     }
-    /* if it's a normal key, save a snapshot before insertion so undo reverts pre-insert state */
+    /* if it's a normal key, schedule a snapshot (debounced) before insertion so undo reverts pre-insert state */
     if (!(event->state & GDK_CONTROL_MASK)) {
         gunichar u = gdk_keyval_to_unicode(event->keyval);
         if (u != 0 || event->keyval == GDK_KEY_BackSpace || event->keyval == GDK_KEY_Delete) {
-            if (ed) editor_push_snapshot(ed);
+            if (ed) editor_schedule_snapshot(ed);
         }
     }
     if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_z || event->keyval == GDK_KEY_Z)) {
         if (ed) editor_undo(ed);
+        /* Clear any scheduled pending snapshot; undo uses explicit snapshots */
+        if (ed && ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
         return TRUE;
     }
     if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_y || event->keyval == GDK_KEY_Y)) {
         if (ed) editor_redo(ed);
+        if (ed && ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
         return TRUE;
     }
     return FALSE;
