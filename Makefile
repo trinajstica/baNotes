@@ -9,7 +9,6 @@ TARGET=baNotes
 PREFIX ?= /usr/local
 DESTDIR ?=
 BINDIR = $(PREFIX)/bin
-ICONDIR = $(PREFIX)/share/icons/hicolor/128x128/apps
 SVGICONDIR = $(PREFIX)/share/icons/hicolor/scalable/apps
 DESKTOPDIR = $(PREFIX)/share/applications
 ICONTHEME = $(PREFIX)/share/icons/hicolor
@@ -35,14 +34,7 @@ install: $(TARGET)
 		install -m 0644 baNotes.desktop $(DESTDIR)$(DESKTOPDIR)/baNotes.desktop; \
 	fi
 
-	# Install icon if present
-	if [ -f baNotes.png ]; then \
-		install -d $(DESTDIR)$(ICONDIR); \
-		install -m 0644 baNotes.png $(DESTDIR)$(ICONDIR)/baNotes.png; \
-		# Also install to /usr/share/pixmaps as a fallback for some desktop environments \
-		install -d $(DESTDIR)/usr/share/pixmaps; \
-		install -m 0644 baNotes.png $(DESTDIR)/usr/share/pixmaps/baNotes.png; \
-	fi
+	# Note: we prefer SVG icons; PNG icon support removed
 	
 	# Install SVG icon if present
 	if [ -f baNotes.svg ]; then \
@@ -63,12 +55,7 @@ uninstall:
 	 if [ -f $(DESTDIR)$(DESKTOPDIR)/baNotes.desktop ]; then \
 		rm -f $(DESTDIR)$(DESKTOPDIR)/baNotes.desktop; \
 	fi
-	 if [ -f $(DESTDIR)$(ICONDIR)/baNotes.png ]; then \
-		rm -f $(DESTDIR)$(ICONDIR)/baNotes.png; \
-	fi
-	 if [ -f $(DESTDIR)/usr/share/pixmaps/baNotes.png ]; then \
-		rm -f $(DESTDIR)/usr/share/pixmaps/baNotes.png; \
-	fi
+	# PNG uninstall steps removed; only SVG icon uninstall handled below
 	 if [ -f $(DESTDIR)$(SVGICONDIR)/baNotes.svg ]; then \
 		rm -f $(DESTDIR)$(SVGICONDIR)/baNotes.svg; \
 	fi

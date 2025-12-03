@@ -1241,12 +1241,12 @@ static void create_tray_icon(void) {
     if (have_theme_icon) {
         /* use icon name from the theme */
         app_indicator_set_icon_full(indicator, "baNotes", "baNotes");
-    } else if (g_file_test("/usr/share/pixmaps/baNotes.png", G_FILE_TEST_EXISTS)) {
-        /* fallback to system pixmaps */
-        app_indicator_set_icon_full(indicator, "/usr/share/pixmaps/baNotes.png", "baNotes");
-    } else if (g_file_test("baNotes.png", G_FILE_TEST_EXISTS)) {
-        /* developer repo-local icon */
-        gchar *cwd_path = g_canonicalize_filename("baNotes.png", NULL);
+    } else if (g_file_test("/usr/share/icons/hicolor/scalable/apps/baNotes.svg", G_FILE_TEST_EXISTS)) {
+        /* fallback to system scalable icon */
+        app_indicator_set_icon_full(indicator, "/usr/share/icons/hicolor/scalable/apps/baNotes.svg", "baNotes");
+    } else if (g_file_test("baNotes.svg", G_FILE_TEST_EXISTS)) {
+        /* developer repo-local icon (SVG) */
+        gchar *cwd_path = g_canonicalize_filename("baNotes.svg", NULL);
         app_indicator_set_icon_full(indicator, cwd_path, "baNotes");
         g_free(cwd_path);
     } else {
