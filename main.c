@@ -106,15 +106,33 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
                      * currently selected note keeps the cursor at the same visual
                      * position (or moves to the new last if the deleted one was
                      * last). If nothing was selected, we leave selection as-is. */
+                    /* Save the clicked location (path index) so we can reselect the proper
+                     * item after reloading. If the click happened on a path, prefer that
+                     * index even if the item wasn't selected. */
                     int saved_index = -1;
-                    GtkTreeSelection *cur_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
-                    GtkTreeModel *cur_model = NULL;
-                    GtkTreeIter cur_iter;
-                    if (gtk_tree_selection_get_selected(cur_sel, &cur_model, &cur_iter)) {
-                        GtkTreePath *cur_path = gtk_tree_model_get_path(cur_model, &cur_iter);
-                        const gint *indices = gtk_tree_path_get_indices(cur_path);
-                        if (indices) saved_index = indices[0];
-                        gtk_tree_path_free(cur_path);
+                    const gint *clicked_indices = gtk_tree_path_get_indices(path);
+                    if (clicked_indices) {
+                        saved_index = clicked_indices[0];
+                        /* Make the clicked item appear selected in the UI (clicking trash
+                         * implies the user's intent for that location). */
+                        GtkTreePath *sel_path = gtk_tree_path_new_from_indices(saved_index, -1);
+                        if (sel_path) {
+                            GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+                            gtk_tree_selection_select_path(sel, sel_path);
+                            gtk_tree_view_set_cursor(GTK_TREE_VIEW(tree), sel_path, NULL, FALSE);
+                            gtk_tree_path_free(sel_path);
+                        }
+                    } else {
+                        /* Fall back to current selection when clicked path is not available */
+                        GtkTreeSelection *cur_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+                        GtkTreeModel *cur_model = NULL;
+                        GtkTreeIter cur_iter;
+                        if (gtk_tree_selection_get_selected(cur_sel, &cur_model, &cur_iter)) {
+                            GtkTreePath *cur_path = gtk_tree_model_get_path(cur_model, &cur_iter);
+                            const gint *indices = gtk_tree_path_get_indices(cur_path);
+                            if (indices) saved_index = indices[0];
+                            gtk_tree_path_free(cur_path);
+                        }
                     }
                     char *dmsg = g_strdup_printf("Delete note '%s'?", title);
                     GtkWidget *dialog = gtk_dialog_new_with_buttons("Delete note",
@@ -148,8 +166,11 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
                                 GtkTreeModel *model = GTK_TREE_MODEL(notes_store);
                                 gint nrows = gtk_tree_model_iter_n_children(model, NULL);
                                 if (nrows > 0) {
-                                    gint reselect = saved_index;
-                                    if (reselect >= nrows) reselect = nrows - 1;
+                                        gint reselect = saved_index;
+                                        /* If the saved index is outside the new bounds (e.g., we
+                                         * deleted the last note), prefer selecting the first note
+                                         * when possible rather than the last. */
+                                        if (reselect >= nrows) reselect = 0;
                                     GtkTreePath *path = gtk_tree_path_new_from_indices(reselect, -1);
                                     GtkTreeSelection *sel2 = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
                                     gtk_tree_selection_select_path(sel2, path);
