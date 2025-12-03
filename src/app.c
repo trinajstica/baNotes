@@ -1,5 +1,6 @@
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <gtk/gtk.h>
+#include <glib.h>
 
 // Return pixbuf for the eye icon
 GdkPixbuf *app_get_eye_icon(void) {
@@ -166,6 +167,192 @@ void app_toggle_word_wrap(void) {
 }
 // End of wrap functions
 
+// Helper: create or lookup a GtkTextTag for a given tag name
+static GtkTextTag* get_or_create_tag_for_name(GtkTextBuffer *buffer, const char *name) {
+    GtkTextTagTable *table = gtk_text_buffer_get_tag_table(buffer);
+    GtkTextTag *tag = NULL;
+    if (table) tag = gtk_text_tag_table_lookup(table, name);
+    if (tag) return tag;
+    /* Create tag based on name conventions: */
+    if (g_strcmp0(name, "BOLD") == 0) {
+        tag = gtk_text_buffer_create_tag(buffer, name, "weight", PANGO_WEIGHT_BOLD, NULL);
+    } else if (g_strcmp0(name, "ITALIC") == 0) {
+        tag = gtk_text_buffer_create_tag(buffer, name, "style", PANGO_STYLE_ITALIC, NULL);
+    } else if (g_strcmp0(name, "UNDERLINE") == 0) {
+        tag = gtk_text_buffer_create_tag(buffer, name, "underline", PANGO_UNDERLINE_SINGLE, NULL);
+    } else if (g_str_has_prefix(name, "FG:#")) {
+        const char *color = name + 4;
+        tag = gtk_text_buffer_create_tag(buffer, name, "foreground", color, NULL);
+        g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
+    } else if (g_str_has_prefix(name, "BG:#")) {
+        const char *color = name + 4;
+        tag = gtk_text_buffer_create_tag(buffer, name, "background", color, NULL);
+        g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
+    } else {
+        /* Generic fallback: create empty tag */
+        tag = gtk_text_buffer_create_tag(buffer, name, NULL);
+    }
+    g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
+    return tag;
+}
+
+// Parse a previously serialized rich note format into buffer. Returns 1 on success.
+static int parse_rich_content_into_buffer(GtkTextBuffer *buffer, const char *raw) {
+    if (!buffer || !raw) return 0;
+    const char *p = raw;
+    const char *hdr = "BA-RICH-V1\n";
+    if (strncmp(p, hdr, strlen(hdr)) != 0) return 0;
+    p += strlen(hdr);
+    // read base64 line
+    const char *nl = strchr(p, '\n');
+    if (!nl) return 0;
+    size_t base64_len = (size_t)(nl - p);
+    char *b64 = g_strndup(p, base64_len);
+    gsize decoded_len = 0;
+    guchar *decoded = g_base64_decode(b64, &decoded_len);
+    g_free(b64);
+    // set plain text
+    gtk_text_buffer_set_text(buffer, (const char*)decoded, (gssize)decoded_len);
+    g_free(decoded);
+    // Now parse tags
+    const char *lines = nl + 1;
+    const char *cur = lines;
+    // Each line like: TAG|NAME|START|END\n
+    while (*cur) {
+        const char *next = strchr(cur, '\n');
+        size_t len = next ? (size_t)(next - cur) : strlen(cur);
+        if (len > 0) {
+            char *line = g_strndup(cur, len);
+            // parse line
+            if (g_str_has_prefix(line, "TAG|")) {
+                // fields separated by '|'
+                char **parts = g_strsplit(line + 4, "|", 4);
+                // parts[0]=NAME parts[1]=START parts[2]=END
+                if (parts && parts[0] && parts[1] && parts[2]) {
+                    const char *name = parts[0];
+                    int start = atoi(parts[1]);
+                    int end = atoi(parts[2]);
+                    GtkTextTag *tag = get_or_create_tag_for_name(buffer, name);
+                    if (tag) {
+                        GtkTextIter s, e;
+                        gtk_text_buffer_get_iter_at_offset(buffer, &s, start);
+                        gtk_text_buffer_get_iter_at_offset(buffer, &e, end);
+                        gtk_text_buffer_apply_tag(buffer, tag, &s, &e);
+                    }
+                }
+                g_strfreev(parts);
+            }
+            g_free(line);
+        }
+        if (!next) break;
+        cur = next + 1;
+    }
+    return 1;
+}
+
+// Public: load note into buffer either as plain text or parse custom format
+int app_load_note_into_buffer(const char *title, GtkTextBuffer *buffer) {
+    char *content = NULL;
+    if (!app_read_note(title, &content)) return 0;
+    if (content && g_str_has_prefix(content, "BA-RICH-V1\n")) {
+        // parse into buffer
+        int res = parse_rich_content_into_buffer(buffer, content);
+        g_free(content);
+        return res;
+    } else {
+        if (content) {
+            gtk_text_buffer_set_text(buffer, content, -1);
+            g_free(content);
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+}
+
+// Public: serialize buffer into custom format (returns g_malloc'd string)
+char *app_serialize_buffer_rich(GtkTextBuffer *buffer) {
+    if (!buffer) return NULL;
+    // Get whole text
+    GtkTextIter s, e;
+    gtk_text_buffer_get_start_iter(buffer, &s);
+    gtk_text_buffer_get_end_iter(buffer, &e);
+    gchar *text = gtk_text_buffer_get_text(buffer, &s, &e, FALSE);
+    gsize text_len = (text ? strlen(text) : 0);
+    gchar *b64 = g_base64_encode((const guchar*)text, text_len);
+    g_free(text);
+    GString *out = g_string_new(NULL);
+    g_string_append(out, "BA-RICH-V1\n");
+    g_string_append(out, b64);
+    g_string_append(out, "\n");
+    g_free(b64);
+    // Iterate tags and write ranges by scanning toggles
+    GtkTextIter it; gtk_text_buffer_get_start_iter(buffer, &it);
+    GtkTextIter end_it; gtk_text_buffer_get_end_iter(buffer, &end_it);
+    GHashTable *active = g_hash_table_new(g_direct_hash, g_direct_equal);
+    // active map: key=tag pointer, value=pointer to int start offset
+    while (!gtk_text_iter_equal(&it, &end_it)) {
+            GSList *tags = gtk_text_iter_get_tags(&it);
+        int offset = gtk_text_iter_get_offset(&it);
+        // find tags that ended
+        GList *p = g_hash_table_get_keys(active);
+        for (GList *q = p; q; q = q->next) {
+            GtkTextTag *atag = (GtkTextTag*)q->data;
+            gboolean still = FALSE;
+                for (GSList *r = tags; r; r = r->next) {
+                if (r->data == atag) { still = TRUE; break; }
+            }
+            if (!still) {
+                gpointer startp = g_hash_table_lookup(active, atag);
+                if (startp) {
+                    int start_off = GPOINTER_TO_INT(startp);
+                    const char *name = (const char*)g_object_get_data(G_OBJECT(atag), "bn-tag-name");
+                    g_string_append_printf(out, "TAG|%s|%d|%d\n", name ? name : "", start_off, offset);
+                }
+                g_hash_table_remove(active, atag);
+            }
+        }
+        g_list_free(p);
+        // find tags that started
+            for (GSList *r = tags; r; r = r->next) {
+            GtkTextTag *tt = (GtkTextTag*)r->data;
+            if (!g_hash_table_contains(active, tt)) {
+                g_hash_table_insert(active, tt, GINT_TO_POINTER(offset));
+            }
+        }
+            if (!gtk_text_iter_forward_char(&it)) break;
+    }
+    // finalize active tags
+    int end_offset = gtk_text_iter_get_offset(&end_it);
+    GList *keys = g_hash_table_get_keys(active);
+    for (GList *q = keys; q; q = q->next) {
+        GtkTextTag *atag = (GtkTextTag*)q->data;
+        gpointer startp = g_hash_table_lookup(active, atag);
+        if (startp) {
+            int start_off = GPOINTER_TO_INT(startp);
+                const char *name = (const char*)g_object_get_data(G_OBJECT(atag), "bn-tag-name");
+            g_string_append_printf(out, "TAG|%s|%d|%d\n", name ? name : "", start_off, end_offset);
+        }
+    }
+    g_list_free(keys);
+    g_hash_table_destroy(active);
+    char *res = g_strdup(out->str);
+    g_string_free(out, TRUE);
+    return res;
+}
+
+// Public: parse a serialized rich string into the given buffer.
+int app_parse_rich_string_into_buffer(const char *serialized, GtkTextBuffer *buffer) {
+    if (!serialized || !buffer) return 0;
+    // If the string is BA-RICH-V1, parse accordingly
+    if (g_str_has_prefix(serialized, "BA-RICH-V1\n")) {
+        return parse_rich_content_into_buffer(buffer, serialized);
+    }
+    // Otherwise treat as plain text
+    gtk_text_buffer_set_text(buffer, serialized, -1);
+    return 1;
+}
+
 void app_init_config_dirs(void) {
     const char *home = getenv("HOME");
     if (!home) return;
@@ -220,15 +407,37 @@ void app_load_notes(GtkListStore *store, const char *filter) {
         if (!f) continue;
         int match = 1;
         if (filter && *filter) {
-            char *line = NULL;
-            size_t len = 0;
-            match = 0;
-            while (getline(&line, &len, f) != -1) {
-                if (strstr(line, filter)) { match = 1; break; }
+            // Read entire file and decode if necessary
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            char *buf = malloc(sz + 1);
+            if (!buf) { fclose(f); continue; }
+            if (fread(buf, 1, sz, f) != (size_t)sz) { free(buf); fclose(f); continue; }
+            buf[sz] = '\0';
+            char *plain = buf;
+            const char *hdr = "BA-RICH-V1\n";
+            if (sz > (long)strlen(hdr) && strncmp(buf, hdr, strlen(hdr)) == 0) {
+                const char *p = buf + strlen(hdr);
+                const char *nl = strchr(p, '\n');
+                if (nl) {
+                    size_t b64len = (size_t)(nl - p);
+                    char *b64 = g_strndup(p, b64len);
+                    gsize dlen = 0;
+                    guchar *dec = g_base64_decode(b64, &dlen);
+                    free(buf);
+                    plain = g_strndup((const char*)dec, dlen);
+                    g_free(dec);
+                    g_free(b64);
+                }
             }
-            free(line);
+            match = (strstr(plain, filter) != NULL);
+            free(plain);
+            fclose(f);
+            if (!match) continue;
+        } else {
+            fclose(f);
         }
-        fclose(f);
         if (!match) continue;
         notes = realloc(notes, sizeof(*notes) * (count+1));
         // Store name without .txt extension

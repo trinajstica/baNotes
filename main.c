@@ -35,6 +35,16 @@ static void create_tray_icon(void);
 static void editor_destroy(GtkWidget *w, gpointer user_data);
 static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeViewColumn *col, gpointer user_data);
 static gboolean on_wrap_label_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data);
+/* forward editor type so prototypes can reference it */
+typedef struct EditorData EditorData;
+static gboolean on_textview_keypress_rich(GtkWidget *widget, GdkEventKey *event, gpointer user_data);
+static void on_bold_toggled(GtkToggleButton *btn, gpointer user_data);
+static void on_italic_toggled(GtkToggleButton *btn, gpointer user_data);
+static void on_underline_toggled(GtkToggleButton *btn, gpointer user_data);
+static void on_fg_color_set(GtkColorButton *cbtn, gpointer user_data);
+static void on_bg_color_set(GtkColorButton *cbtn, gpointer user_data);
+static GtkWidget *create_rich_toolbar_for_editor(EditorData *ed);
+static void on_insert_text(GtkTextBuffer *buffer, GtkTextIter *location, gchar *text, gint len, gpointer user_data);
 // single-instance socket path
 static char socket_path[4096] = {0};
 static int server_sock = -1;
@@ -52,11 +62,27 @@ static void on_editor_ok_clicked(GtkButton *btn, gpointer user_data);
 static char *first_nonempty_line(const char *text);
 
 // Editor data
-typedef struct {
+typedef struct EditorData EditorData;
+
+// Editor data
+struct EditorData {
     char *title; // brez .txt
     GtkTextBuffer *buffer;
     GtkWidget *window;
-} EditorData;
+    GtkWidget *tview;
+    gboolean bold_mode;
+    gboolean italic_mode;
+    gboolean underline_mode;
+    char *fg_color; /* e.g. "#rrggbb" or NULL */
+    char *bg_color;
+    GtkWidget *bold_btn;
+    GtkWidget *italic_btn;
+    GtkWidget *underline_btn;
+    GList *undo_stack; // list of char* snapshots (serialized)
+    GList *redo_stack; // list of char* snapshots
+    int max_history;
+    gboolean ignore_changes;
+};
 
 static char *sanitize_title(const char *s) {
     if (!s) return NULL;
@@ -208,7 +234,7 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
 static void on_editor_ok_clicked(GtkButton *btn, gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
     if (!ed) return;
-    GtkTextBuffer *buffer = ed->buffer;
+        GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ed->tview));
     GtkTextIter start, end;
     gtk_text_buffer_get_start_iter(buffer, &start);
     gtk_text_buffer_get_end_iter(buffer, &end);
@@ -294,7 +320,10 @@ static void on_editor_ok_clicked(GtkButton *btn, gpointer user_data) {
         }
 
         // Zapiši vsebino v datoteko (uporabi trenutno ed->title)
-        app_write_note(ed->title, text);
+        char *ser = app_serialize_buffer_rich(buffer);
+        if (!ser) ser = g_strdup(text);
+        app_write_note(ed->title, ser);
+        g_free(ser);
         g_free(new_title);
     }
 
@@ -305,12 +334,68 @@ static void on_editor_ok_clicked(GtkButton *btn, gpointer user_data) {
     gtk_widget_destroy(ed->window);
 }
 
+// Push the current buffer snapshot on undo stack
+static void editor_push_snapshot(EditorData *ed) {
+    if (!ed) return;
+    if (ed->ignore_changes) return;
+    char *snap = app_serialize_buffer_rich(ed->buffer);
+    if (!snap) return;
+    // Avoid duplicate snapshots if identical to last
+    if (ed->undo_stack && ed->undo_stack->data && g_strcmp0((char*)ed->undo_stack->data, snap) == 0) {
+        g_free(snap); return;
+    }
+    ed->undo_stack = g_list_prepend(ed->undo_stack, snap);
+    // Trim history to max
+    while (ed->max_history > 0 && g_list_length(ed->undo_stack) > ed->max_history) {
+        GList *last = g_list_last(ed->undo_stack);
+        if (last) {
+            g_free(last->data);
+            ed->undo_stack = g_list_delete_link(ed->undo_stack, last);
+        }
+    }
+    // Clearing redo on a new snapshot
+    g_list_free_full(ed->redo_stack, g_free);
+    ed->redo_stack = NULL;
+}
+
+// Apply a snapshot string into editor buffer
+static void editor_apply_snapshot(EditorData *ed, const char *snap) {
+    if (!ed || !snap) return;
+    ed->ignore_changes = TRUE;
+    app_parse_rich_string_into_buffer(snap, ed->buffer);
+    ed->ignore_changes = FALSE;
+}
+
+// Undo: push current state to redo and pop from undo stack
+static void editor_undo(EditorData *ed) {
+    if (!ed || !ed->undo_stack) return;
+    char *cur = app_serialize_buffer_rich(ed->buffer);
+    if (cur) ed->redo_stack = g_list_prepend(ed->redo_stack, cur);
+    GList *first = ed->undo_stack;
+    char *snap = (char*)first->data;
+    ed->undo_stack = g_list_delete_link(ed->undo_stack, first);
+    editor_apply_snapshot(ed, snap);
+    g_free(snap);
+}
+
+// Redo: push current state to undo and pop from redo stack
+static void editor_redo(EditorData *ed) {
+    if (!ed || !ed->redo_stack) return;
+    char *cur = app_serialize_buffer_rich(ed->buffer);
+    if (cur) ed->undo_stack = g_list_prepend(ed->undo_stack, cur);
+    GList *first = ed->redo_stack;
+    char *snap = (char*)first->data;
+    ed->redo_stack = g_list_delete_link(ed->redo_stack, first);
+    editor_apply_snapshot(ed, snap);
+    g_free(snap);
+}
+
 static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeViewColumn *col, gpointer user_data) {
     GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
     GtkTreeIter iter;
     if (!gtk_tree_model_get_iter(model, &iter, path)) return;
     gchar *title = NULL;
-    gtk_tree_model_get(model, &iter, 0, &title, -1);
+        gtk_tree_model_get(model, &iter, 0, &title, -1);
     if (!title) return;
 
     // Create editor window (save on 'OK', 'Cancel' discards changes)
@@ -345,17 +430,30 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tview), app_get_word_wrap() ? GTK_WRAP_WORD : GTK_WRAP_NONE);
     gtk_widget_add_events(tview, GDK_KEY_PRESS_MASK);
     g_signal_connect(tview, "key-press-event", G_CALLBACK(app_textview_keypress), NULL);
+    /* rich keypress handler will be connected after EditorData is created */
+    /* rich keypress handler connects directly to the buffer (via gtk_text_view_get_buffer) */
 
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tview));
-    // Load content
-    char *content = NULL;
-    if (!app_read_note(title, &content)) content = g_strdup("");
-    gtk_text_buffer_set_text(buffer, content, -1);
+    // Load content into buffer (with potential rich parsing)
+    app_load_note_into_buffer(title, buffer);
 
     EditorData *ed = g_new0(EditorData, 1);
     ed->title = g_strdup(title);
     ed->buffer = buffer;
     ed->window = ewin;
+    ed->tview = tview;
+    ed->bold_mode = ed->italic_mode = ed->underline_mode = FALSE;
+    ed->fg_color = NULL; ed->bg_color = NULL;
+    ed->undo_stack = NULL; ed->redo_stack = NULL; ed->max_history = 128; ed->ignore_changes = FALSE;
+    /* initial snapshot for add dialog */
+    editor_push_snapshot(ed);
+    ed->undo_stack = NULL; ed->redo_stack = NULL; ed->max_history = 128; ed->ignore_changes = FALSE;
+    // Save initial snapshot for undo
+    editor_push_snapshot(ed);
+
+    // Add simple rich-text toolbar above buttons
+    GtkWidget *toolbar = create_rich_toolbar_for_editor(ed);
+    gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
 
     // Add OK / Cancel buttons
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
@@ -381,12 +479,15 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
     g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_widget_destroy), ewin);
 
     // OK: save (respect existing file names — check collisions)
+    // connect insert-text to handle typed characters
+    g_signal_connect(ed->buffer, "insert-text", G_CALLBACK(on_insert_text), ed);
+    // connect rich keypress handler now that EditorData and buttons exist
+    g_signal_connect(tview, "key-press-event", G_CALLBACK(on_textview_keypress_rich), ed);
     g_signal_connect(ok, "clicked", G_CALLBACK(on_editor_ok_clicked), ed);
 
     g_signal_connect(ewin, "destroy", G_CALLBACK(editor_destroy), ed);
 
     gtk_widget_show_all(ewin);
-    g_free(content);
     g_free(title);
 }
 
@@ -394,7 +495,279 @@ static void editor_destroy(GtkWidget *w, gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
     if (!ed) return;
     if (ed->title) g_free(ed->title);
+    if (ed->fg_color) g_free(ed->fg_color);
+    if (ed->bg_color) g_free(ed->bg_color);
+    if (ed->undo_stack) g_list_free_full(ed->undo_stack, g_free);
+    if (ed->redo_stack) g_list_free_full(ed->redo_stack, g_free);
     g_free(ed);
+}
+
+/* Create 'clipboard' operation: copy current selection into a buffer for later paste */
+static void editor_copy_to_clipboard(EditorData *ed) {
+    if (!ed || !ed->buffer) return;
+    GtkTextIter s,e;
+    if (!gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e)) return;
+    gchar *selected = gtk_text_buffer_get_text(ed->buffer, &s, &e, FALSE);
+    if (!selected) return;
+    // store into a per-editor 'clipboard' data stored in editor struct (use fg/bg?)
+    // Reuse redo_stack as a clipboard store? Better: add new field; but for quick approach, add clipboard string.
+    char *oldcb = (char*)g_object_get_data(G_OBJECT(ed->window), "editor-clipboard");
+    if (oldcb) g_free(oldcb);
+    g_object_set_data_full(G_OBJECT(ed->window), "editor-clipboard", g_strdup(selected), g_free);
+    g_free(selected);
+}
+
+/* Paste clipboard contents into buffer at cursor position */
+static void editor_paste_from_clipboard(EditorData *ed) {
+    if (!ed || !ed->buffer) return;
+    char *clip = (char*)g_object_get_data(G_OBJECT(ed->window), "editor-clipboard");
+    if (!clip) return;
+    GtkTextIter it;
+    GtkTextMark *m = gtk_text_buffer_get_insert(ed->buffer);
+    gtk_text_buffer_get_iter_at_mark(ed->buffer, &it, m);
+    // Save snapshot before pasting
+    editor_push_snapshot(ed);
+    gtk_text_buffer_insert(ed->buffer, &it, clip, -1);
+}
+
+/* UI rich-text helpers and callbacks */
+static GtkTextTag* ui_get_or_create_tag(GtkTextBuffer *buffer, const char *name) {
+    GtkTextTagTable *table = gtk_text_buffer_get_tag_table(buffer);
+    GtkTextTag *tag = NULL;
+    if (table) tag = gtk_text_tag_table_lookup(table, name);
+    if (tag) return tag;
+    if (g_strcmp0(name, "BOLD") == 0) {
+        tag = gtk_text_buffer_create_tag(buffer, name, "weight", PANGO_WEIGHT_BOLD, NULL);
+        g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
+    } else if (g_strcmp0(name, "ITALIC") == 0) {
+        tag = gtk_text_buffer_create_tag(buffer, name, "style", PANGO_STYLE_ITALIC, NULL);
+        g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
+    } else if (g_strcmp0(name, "UNDERLINE") == 0) {
+        tag = gtk_text_buffer_create_tag(buffer, name, "underline", PANGO_UNDERLINE_SINGLE, NULL);
+        g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
+    } else if (g_str_has_prefix(name, "FG:#")) {
+        const char *color = name + 4; // FG:#RRGGBB, color starts after FG:#
+        char clr[16]; snprintf(clr, sizeof(clr), "#%s", color);
+        tag = gtk_text_buffer_create_tag(buffer, name, "foreground", clr, NULL);
+        g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
+    } else if (g_str_has_prefix(name, "BG:#")) {
+        const char *color = name + 4;
+        char clr[16]; snprintf(clr, sizeof(clr), "#%s", color);
+        tag = gtk_text_buffer_create_tag(buffer, name, "background", clr, NULL);
+        g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
+    } else {
+        tag = gtk_text_buffer_create_tag(buffer, name, NULL);
+        g_object_set_data_full(G_OBJECT(tag), "bn-tag-name", g_strdup(name), g_free);
+    }
+    return tag;
+}
+
+/* ui_toggle_tag_on_selection_generic removed (unused) */
+
+static void editor_apply_tag_on_selection(EditorData *ed, const char *tagname, gboolean apply) {
+    GtkTextIter s, e;
+    GtkTextBuffer *buf = ed->buffer;
+    if (!gtk_text_buffer_get_selection_bounds(buf, &s, &e)) return;
+    GtkTextTag *tag = ui_get_or_create_tag(buf, tagname);
+    if (apply) gtk_text_buffer_apply_tag(buf, tag, &s, &e);
+    else gtk_text_buffer_remove_tag(buf, tag, &s, &e);
+}
+
+static void on_bold_toggled(GtkToggleButton *btn, gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    gboolean active = gtk_toggle_button_get_active(btn);
+    /* If selection present, apply/remove to selection, but do not persist mode */
+    GtkTextIter s,e; gboolean sel = FALSE;
+    if (ed && ed->buffer) sel = gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e);
+    if (sel) {
+        editor_push_snapshot(ed);
+        editor_apply_tag_on_selection(ed, "BOLD", active);
+        /* switch mode off after applying */
+        ed->bold_mode = FALSE;
+        g_signal_handlers_block_by_func(btn, G_CALLBACK(on_bold_toggled), ed);
+        gtk_toggle_button_set_active(btn, FALSE);
+        g_signal_handlers_unblock_by_func(btn, G_CALLBACK(on_bold_toggled), ed);
+    } else {
+        ed->bold_mode = active;
+    }
+    if (ed && ed->tview) gtk_widget_grab_focus(ed->tview);
+}
+static void on_italic_toggled(GtkToggleButton *btn, gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    gboolean active = gtk_toggle_button_get_active(btn);
+    GtkTextIter s,e; gboolean sel = FALSE;
+    if (ed && ed->buffer) sel = gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e);
+    if (sel) {
+        editor_push_snapshot(ed);
+        editor_apply_tag_on_selection(ed, "ITALIC", active);
+        ed->italic_mode = FALSE;
+        g_signal_handlers_block_by_func(btn, G_CALLBACK(on_italic_toggled), ed);
+        gtk_toggle_button_set_active(btn, FALSE);
+        g_signal_handlers_unblock_by_func(btn, G_CALLBACK(on_italic_toggled), ed);
+    } else {
+        ed->italic_mode = active;
+    }
+    if (ed && ed->tview) gtk_widget_grab_focus(ed->tview);
+}
+static void on_underline_toggled(GtkToggleButton *btn, gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    gboolean active = gtk_toggle_button_get_active(btn);
+    GtkTextIter s,e; gboolean sel = FALSE;
+    if (ed && ed->buffer) sel = gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e);
+    if (sel) {
+        editor_push_snapshot(ed);
+        editor_apply_tag_on_selection(ed, "UNDERLINE", active);
+        ed->underline_mode = FALSE;
+        g_signal_handlers_block_by_func(btn, G_CALLBACK(on_underline_toggled), ed);
+        gtk_toggle_button_set_active(btn, FALSE);
+        g_signal_handlers_unblock_by_func(btn, G_CALLBACK(on_underline_toggled), ed);
+    } else {
+        ed->underline_mode = active;
+    }
+    if (ed && ed->tview) gtk_widget_grab_focus(ed->tview);
+}
+
+/* ui_apply_color_on_selection removed (unused) */
+
+static void on_fg_color_set(GtkColorButton *cbtn, gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    GdkRGBA color; gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(cbtn), &color);
+    char *hex = g_strdup_printf("#%02x%02x%02x", (int)(color.red*255), (int)(color.green*255), (int)(color.blue*255));
+    /* apply to selection if present, otherwise set persistent color mode */
+    if (ed && ed->buffer) {
+        char name[64]; snprintf(name, sizeof(name), "FG:#%02x%02x%02x", (int)(color.red*255), (int)(color.green*255), (int)(color.blue*255));
+        GtkTextIter s,e; if (gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e)) {
+            editor_push_snapshot(ed);
+            GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, name);
+            gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e);
+            /* do not persist color if selection was applied */
+        } else {
+            g_free(ed->fg_color); ed->fg_color = g_strdup(hex);
+        }
+    }
+    g_free(hex);
+    if (ed && ed->tview) gtk_widget_grab_focus(ed->tview);
+}
+static void on_bg_color_set(GtkColorButton *cbtn, gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    GdkRGBA color; gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(cbtn), &color);
+    char *hex = g_strdup_printf("#%02x%02x%02x", (int)(color.red*255), (int)(color.green*255), (int)(color.blue*255));
+    /* apply to selection if present */
+    if (ed && ed->buffer) {
+        char name[64]; snprintf(name, sizeof(name), "BG:#%02x%02x%02x", (int)(color.red*255), (int)(color.green*255), (int)(color.blue*255));
+        GtkTextIter s,e; if (gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e)) {
+            editor_push_snapshot(ed);
+            GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, name);
+            gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e);
+            /* do not persist color if selection was applied */
+        } else {
+            g_free(ed->bg_color); ed->bg_color = g_strdup(hex);
+        }
+    }
+    g_free(hex);
+    if (ed && ed->tview) gtk_widget_grab_focus(ed->tview);
+}
+static void on_copy_clicked(GtkButton *btn, gpointer user_data) { editor_copy_to_clipboard((EditorData*)user_data); }
+static void on_paste_clicked(GtkButton *btn, gpointer user_data) { editor_paste_from_clipboard((EditorData*)user_data); }
+static void on_undo_clicked(GtkButton *btn, gpointer user_data) { editor_undo((EditorData*)user_data); }
+static void on_redo_clicked(GtkButton *btn, gpointer user_data) { editor_redo((EditorData*)user_data); }
+
+static gboolean on_textview_keypress_rich(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
+    /* user_data is EditorData* */
+    EditorData *ed = (EditorData*)user_data;
+    if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_b || event->keyval == GDK_KEY_B)) {
+        if (ed) {
+            ed->bold_mode = !ed->bold_mode;
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->bold_btn), ed->bold_mode);
+        }
+        return TRUE;
+    }
+    if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_i || event->keyval == GDK_KEY_I)) {
+        if (ed) {
+            ed->italic_mode = !ed->italic_mode;
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->italic_btn), ed->italic_mode);
+        }
+        return TRUE;
+    }
+    /* if it's a normal key, save a snapshot before insertion so undo reverts pre-insert state */
+    if (!(event->state & GDK_CONTROL_MASK)) {
+        gunichar u = gdk_keyval_to_unicode(event->keyval);
+        if (u != 0 || event->keyval == GDK_KEY_BackSpace || event->keyval == GDK_KEY_Delete) {
+            if (ed) editor_push_snapshot(ed);
+        }
+    }
+    if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_z || event->keyval == GDK_KEY_Z)) {
+        if (ed) editor_undo(ed);
+        return TRUE;
+    }
+    if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_y || event->keyval == GDK_KEY_Y)) {
+        if (ed) editor_redo(ed);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* insert-text handler: schedule applying tags to newly inserted text */
+typedef struct {
+    EditorData *ed;
+    int start;
+    int len;
+} InsertCtx;
+
+static gboolean apply_tags_to_range_idle(gpointer user_data) {
+    InsertCtx *ctx = (InsertCtx*)user_data;
+    if (!ctx || !ctx->ed || !ctx->ed->buffer) { g_free(ctx); return FALSE; }
+    GtkTextIter s, e;
+    gtk_text_buffer_get_iter_at_offset(ctx->ed->buffer, &s, ctx->start);
+    gtk_text_buffer_get_iter_at_offset(ctx->ed->buffer, &e, ctx->start + ctx->len);
+    /* apply tags according to editor flags */
+    if (ctx->ed->bold_mode) { GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, "BOLD"); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
+    if (ctx->ed->italic_mode) { GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, "ITALIC"); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
+    if (ctx->ed->underline_mode) { GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, "UNDERLINE"); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
+    if (ctx->ed->fg_color) { char name[64]; snprintf(name, sizeof(name), "FG:%s", ctx->ed->fg_color); /* our real format uses FG:#rrggbb - ensure prefix */ snprintf(name, sizeof(name), "FG:%s", ctx->ed->fg_color); GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, name); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
+    if (ctx->ed->bg_color) { char name[64]; snprintf(name, sizeof(name), "BG:%s", ctx->ed->bg_color); GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, name); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
+    g_free(ctx);
+    return FALSE;
+}
+
+static void on_insert_text(GtkTextBuffer *buffer, GtkTextIter *location, gchar *text, gint len, gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    if (!ed) return;
+    /* If no modes active, nothing to do */
+    if (!ed->bold_mode && !ed->italic_mode && !ed->underline_mode && !ed->fg_color && !ed->bg_color) return;
+    int start = gtk_text_iter_get_offset(location);
+    InsertCtx *ctx = g_new0(InsertCtx, 1);
+    ctx->ed = ed;
+    ctx->start = start;
+    ctx->len = len;
+    /* Schedule to run after insertion is done (in main loop) */
+    g_idle_add(apply_tags_to_range_idle, ctx);
+}
+
+static GtkWidget *create_rich_toolbar_for_editor(EditorData *ed) {
+    GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *tb_b = gtk_toggle_button_new_with_label("B"); gtk_widget_set_tooltip_text(tb_b, "Bold (Ctrl+B)"); g_signal_connect(tb_b, "toggled", G_CALLBACK(on_bold_toggled), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_b, FALSE, FALSE, 0); ed->bold_btn = tb_b;
+    GtkWidget *tb_i = gtk_toggle_button_new_with_label("I"); gtk_widget_set_tooltip_text(tb_i, "Italic (Ctrl+I)"); g_signal_connect(tb_i, "toggled", G_CALLBACK(on_italic_toggled), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_i, FALSE, FALSE, 0); ed->italic_btn = tb_i;
+    GtkWidget *tb_u = gtk_toggle_button_new_with_label("U"); gtk_widget_set_tooltip_text(tb_u, "Underline"); g_signal_connect(tb_u, "toggled", G_CALLBACK(on_underline_toggled), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_u, FALSE, FALSE, 0); ed->underline_btn = tb_u;
+    GtkWidget *tb_fg = gtk_color_button_new(); gtk_widget_set_tooltip_text(tb_fg, "Text color"); g_signal_connect(tb_fg, "color-set", G_CALLBACK(on_fg_color_set), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_fg, FALSE, FALSE, 0);
+    GtkWidget *tb_bg = gtk_color_button_new(); gtk_widget_set_tooltip_text(tb_bg, "Background color"); g_signal_connect(tb_bg, "color-set", G_CALLBACK(on_bg_color_set), ed); gtk_box_pack_start(GTK_BOX(toolbar), tb_bg, FALSE, FALSE, 0);
+    /* Clipboard, Undo, Redo buttons */
+    GtkWidget *copy_btn = gtk_button_new_with_label("Copy"); gtk_widget_set_tooltip_text(copy_btn, "Copy selection to editor clipboard"); gtk_box_pack_start(GTK_BOX(toolbar), copy_btn, FALSE, FALSE, 0);
+    GtkWidget *paste_btn = gtk_button_new_with_label("Paste"); gtk_widget_set_tooltip_text(paste_btn, "Paste editor clipboard at cursor"); gtk_box_pack_start(GTK_BOX(toolbar), paste_btn, FALSE, FALSE, 0);
+    GtkWidget *undo_btn = gtk_button_new_with_label("Undo"); gtk_widget_set_tooltip_text(undo_btn, "Undo"); gtk_box_pack_start(GTK_BOX(toolbar), undo_btn, FALSE, FALSE, 0);
+    GtkWidget *redo_btn = gtk_button_new_with_label("Redo"); gtk_widget_set_tooltip_text(redo_btn, "Redo"); gtk_box_pack_start(GTK_BOX(toolbar), redo_btn, FALSE, FALSE, 0);
+    /* Set initial toggle state from EditorData */
+    if (ed) {
+        if (ed->bold_mode && ed->bold_btn) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->bold_btn), TRUE);
+        if (ed->italic_mode && ed->italic_btn) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->italic_btn), TRUE);
+        if (ed->underline_mode && ed->underline_btn) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ed->underline_btn), TRUE);
+    }
+    /* Now that buttons exist, connect them properly for clipboard and history */
+    g_signal_connect(copy_btn, "clicked", G_CALLBACK(on_copy_clicked), ed);
+    g_signal_connect(paste_btn, "clicked", G_CALLBACK(on_paste_clicked), ed);
+    g_signal_connect(undo_btn, "clicked", G_CALLBACK(on_undo_clicked), ed);
+    g_signal_connect(redo_btn, "clicked", G_CALLBACK(on_redo_clicked), ed);
+    return toolbar;
 }
 
 // Click handler for wrap label: double-click toggles wrap setting
@@ -590,8 +963,11 @@ static void on_add_ok_clicked(GtkButton *btn, gpointer user_data) {
             }
         }
 
-        // Save note with unique name
-        app_write_note(unique, text);
+        // Serialize buffer into our rich format and save note with unique name
+        char *ser = app_serialize_buffer_rich(buf);
+        if (!ser) ser = g_strdup(text);
+        app_write_note(unique, ser);
+        g_free(ser);
         // Refresh list
         app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
         g_free(unique);
@@ -659,8 +1035,27 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     NewNoteData *nd = g_new0(NewNoteData, 1);
     nd->dlg = GTK_WINDOW(dlg);
     nd->tview = tview;
+    /* Create an EditorData for the new note so toolbar behavior and insert-text work the same */
+    EditorData *ed = g_new0(EditorData, 1);
+    ed->title = NULL;
+    ed->buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tview));
+    ed->window = dlg;
+    ed->tview = tview;
+    ed->bold_mode = ed->italic_mode = ed->underline_mode = FALSE;
+    ed->fg_color = NULL; ed->bg_color = NULL;
+    nd->tview = tview;
+    /* Attach EditorData pointer to dlg so we can free later in destroy */
+    g_object_set_data(G_OBJECT(dlg), "editor-data", ed);
 
     g_signal_connect(ok, "clicked", G_CALLBACK(on_add_ok_clicked), nd);
+    /* Add a toolbar for the new note that uses our EditorData */
+    GtkWidget *toolbar2 = create_rich_toolbar_for_editor(ed);
+    gtk_box_pack_start(GTK_BOX(vbox), toolbar2, FALSE, FALSE, 0);
+    /* register textview and insert-text handler */
+    app_register_textview(tview, wrap_label);
+    g_signal_connect(tview, "key-press-event", G_CALLBACK(on_textview_keypress_rich), ed);
+    g_signal_connect(dlg, "destroy", G_CALLBACK(editor_destroy), ed);
+    g_signal_connect(ed->buffer, "insert-text", G_CALLBACK(on_insert_text), ed);
 
     gtk_widget_show_all(dlg);
 }

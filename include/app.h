@@ -49,4 +49,13 @@ int app_get_word_wrap(void);
 int app_register_textview(GtkWidget *tview, GtkWidget *label);
 void app_unregister_textview(GtkWidget *tview);
 
+// Rich-text helpers: load a note into a GtkTextBuffer (decodes custom format if present)
+// and serialize a buffer into the custom format (returns a newly allocated string).
+// Returned string must be freed with g_free.
+int app_load_note_into_buffer(const char *title, GtkTextBuffer *buffer);
+char *app_serialize_buffer_rich(GtkTextBuffer *buffer);
+// Parse a serialized rich string (BA-RICH-V1 or plain text) into a text buffer.
+// Returns 1 on success, 0 on error.
+int app_parse_rich_string_into_buffer(const char *serialized, GtkTextBuffer *buffer);
+
 #endif // APP_H
