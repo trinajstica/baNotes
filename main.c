@@ -101,6 +101,21 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
                 gchar *title = NULL;
                 gtk_tree_model_get(model, &iter, 0, &title, -1);
                 if (title) {
+                    /* Remember selected index before reloading notes, so we can restore
+                     * selection after deleting a note. This ensures that deleting the
+                     * currently selected note keeps the cursor at the same visual
+                     * position (or moves to the new last if the deleted one was
+                     * last). If nothing was selected, we leave selection as-is. */
+                    int saved_index = -1;
+                    GtkTreeSelection *cur_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+                    GtkTreeModel *cur_model = NULL;
+                    GtkTreeIter cur_iter;
+                    if (gtk_tree_selection_get_selected(cur_sel, &cur_model, &cur_iter)) {
+                        GtkTreePath *cur_path = gtk_tree_model_get_path(cur_model, &cur_iter);
+                        const gint *indices = gtk_tree_path_get_indices(cur_path);
+                        if (indices) saved_index = indices[0];
+                        gtk_tree_path_free(cur_path);
+                    }
                     char *dmsg = g_strdup_printf("Delete note '%s'?", title);
                     GtkWidget *dialog = gtk_dialog_new_with_buttons("Delete note",
                         GTK_WINDOW(main_window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
@@ -126,7 +141,23 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
                     g_free(dmsg);
                     if (resp == GTK_RESPONSE_YES) {
                         if (app_delete_note(title)) {
+                            // Reload notes
                             app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
+                            // Restore selection if we remembered one and the list is not empty
+                            if (saved_index >= 0 && tree && notes_store) {
+                                GtkTreeModel *model = GTK_TREE_MODEL(notes_store);
+                                gint nrows = gtk_tree_model_iter_n_children(model, NULL);
+                                if (nrows > 0) {
+                                    gint reselect = saved_index;
+                                    if (reselect >= nrows) reselect = nrows - 1;
+                                    GtkTreePath *path = gtk_tree_path_new_from_indices(reselect, -1);
+                                    GtkTreeSelection *sel2 = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+                                    gtk_tree_selection_select_path(sel2, path);
+                                    gtk_tree_view_set_cursor(GTK_TREE_VIEW(tree), path, NULL, FALSE);
+                                    gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(tree), path, NULL, TRUE, 0.5, 0.0);
+                                    gtk_tree_path_free(path);
+                                }
+                            }
                         } else {
                             GtkWidget *err = gtk_dialog_new_with_buttons("Error",
                                 GTK_WINDOW(main_window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
@@ -638,12 +669,17 @@ static GtkWidget* create_main_window(void) {
 
     // Trash icon (fixed width, right)
     GtkCellRenderer *renderer_trash = gtk_cell_renderer_pixbuf_new();
+    /* Add horizontal padding so the icon is not placed flush against the column
+     * right edge; this helps avoid overlaying with the vertical scrollbar. */
+    gtk_cell_renderer_set_padding(renderer_trash, 8, 2);
     GtkTreeViewColumn *col_trash = gtk_tree_view_column_new();
     gtk_tree_view_column_set_title(col_trash, "");
     gtk_tree_view_column_pack_start(col_trash, renderer_trash, FALSE);
     gtk_tree_view_column_add_attribute(col_trash, renderer_trash, "pixbuf", 1);
     gtk_tree_view_column_set_sizing(col_trash, GTK_TREE_VIEW_COLUMN_FIXED);
-    gtk_tree_view_column_set_fixed_width(col_trash, 40);
+    /* Fixed width: original 40px + additional space to fit padding and avoid
+     * overlap with overlay scrollbars. */
+    gtk_tree_view_column_set_fixed_width(col_trash, 56);
     gtk_tree_view_column_set_alignment(col_trash, 1.0);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col_trash);
 
