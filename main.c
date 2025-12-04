@@ -871,6 +871,9 @@ static gboolean bring_main_window(gpointer user_data) {
         /* Select first note row when window is shown */
         select_first_note_row();
         gtk_window_present(GTK_WINDOW(main_window));
+        gtk_window_set_keep_above(GTK_WINDOW(main_window), TRUE);
+        gtk_window_set_focus_on_map(GTK_WINDOW(main_window), TRUE);
+        gtk_widget_grab_focus(main_window);
     }
     return FALSE; // run once
 }
@@ -1186,6 +1189,7 @@ static gboolean on_window_focus_in(GtkWidget *widget, GdkEventFocus *event, gpoi
     /* Reload notes list when main window gains focus */
     if (notes_store && search_entry) {
         app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
+        select_first_note_row();
     }
     return FALSE; /* propagate event */
 }
