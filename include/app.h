@@ -28,6 +28,8 @@ int app_rename_note(const char *old_title, const char *new_title);
 int app_read_window_position(int *x, int *y);
 void app_save_window_position(int x, int y);
 
+
+
 // Word wrap setting persistence
 // Reads the word-wrap setting into *enabled (1 = enabled, 0 = disabled).
 // Returns 1 if setting read successfully, 0 otherwise (e.g. file missing).

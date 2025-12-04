@@ -24,6 +24,7 @@ static GtkWidget *tree = NULL;
 static AppIndicator *indicator = NULL;
 static int current_x = -1;
 static int current_y = -1;
+static char *last_selected_note = NULL;  // RAM-only: last selected note title
 
 // Napoved funkcij
 static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data);
@@ -56,7 +57,7 @@ static int server_sock = -1;
 // Forward
 static void *instance_server_thread(void *arg);
 static gboolean bring_main_window(gpointer user_data);
-static void select_first_note_row(void);
+
 
 static void cleanup_socket(void) {
     if (server_sock != -1) close(server_sock);
@@ -115,6 +116,25 @@ static char *sanitize_title(const char *s) {
         snprintf(out, len + 1 + 32, "untitled_%ld", (long)t);
     }
     return out;
+}
+
+// Handler: selection changed
+static void on_selection_changed(GtkTreeSelection *selection, gpointer data) {
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        gchar *title = NULL;
+        gtk_tree_model_get(model, &iter, 0, &title, -1);
+        if (title) {
+            g_print("DEBUG: on_selection_changed: saving '%s' to RAM\n", title);
+            // Save to RAM only
+            if (last_selected_note) g_free(last_selected_note);
+            last_selected_note = g_strdup(title);
+            g_free(title);
+        }
+    } else {
+        g_print("DEBUG: on_selection_changed: no selection\n");
+    }
 }
 
 // Handler: klik na tree view - preveri, če je klik na stolpcu smeti
@@ -860,6 +880,65 @@ static gboolean on_wrap_label_button_press(GtkWidget *widget, GdkEventButton *ev
     return FALSE;
 }
 
+
+
+// Helper: select the last saved note, or first if not found/empty
+static void select_last_or_first_note(void) {
+    if (!tree || !notes_store) return;
+    
+    g_print("DEBUG: select_last_or_first_note: last_selected_note='%s'\n", 
+            last_selected_note ? last_selected_note : "(null)");
+    
+    GtkTreeModel *model = GTK_TREE_MODEL(notes_store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+    GtkTreePath *found_path = NULL;
+    
+    if (last_selected_note && valid) {
+        do {
+            char *title = NULL;
+            gtk_tree_model_get(model, &iter, 0, &title, -1);
+            if (title) {
+                if (g_strcmp0(title, last_selected_note) == 0) {
+                    found_path = gtk_tree_model_get_path(model, &iter);
+                    g_print("DEBUG: Found last note '%s' at path\n", title);
+                    g_free(title);
+                    break;
+                }
+                g_free(title);
+            }
+        } while (gtk_tree_model_iter_next(model, &iter));
+    }
+    
+    if (!found_path) {
+        // Fallback to first
+        if (gtk_tree_model_get_iter_first(model, &iter)) {
+            found_path = gtk_tree_model_get_path(model, &iter);
+            g_print("DEBUG: Fallback to first note\n");
+        }
+    }
+    
+    if (found_path) {
+        GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+        
+        // Block the selection-changed signal to prevent recursive updates
+        g_signal_handlers_block_by_func(sel, G_CALLBACK(on_selection_changed), NULL);
+        
+        gtk_tree_selection_select_path(sel, found_path);
+        gtk_tree_view_set_cursor(GTK_TREE_VIEW(tree), found_path, NULL, FALSE);
+        gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(tree), found_path, NULL, TRUE, 0.5, 0.0);
+        
+        // Unblock the signal
+        g_signal_handlers_unblock_by_func(sel, G_CALLBACK(on_selection_changed), NULL);
+        
+        gtk_tree_path_free(found_path);
+        
+        // Give focus to the tree view
+        gtk_widget_grab_focus(tree);
+        g_print("DEBUG: Selection complete, focus set to tree\n");
+    }
+}
+
 // Helper to show main window, position it, and ensure it is focused/on-top
 static void show_main_window(void) {
     if (!main_window) return;
@@ -870,8 +949,15 @@ static void show_main_window(void) {
         }
         gtk_widget_show_all(main_window);
     }
-    /* Select first note row when window is shown */
-    select_first_note_row();
+    
+    /* Refresh notes list when showing window */
+    if (notes_store && search_entry) {
+        app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
+    }
+    
+    /* Select last note row when window is shown */
+    select_last_or_first_note();
+    
     gtk_window_present(GTK_WINDOW(main_window));
     gtk_window_set_keep_above(GTK_WINDOW(main_window), TRUE);
     gtk_window_set_focus_on_map(GTK_WINDOW(main_window), TRUE);
@@ -1051,21 +1137,7 @@ static GtkWidget* create_editor_dialog(const char *window_title, const char *not
     return dlg;
 }
 
-/* Select the first row in the notes tree view, if present */
-static void select_first_note_row(void) {
-    if (tree && notes_store) {
-        GtkTreeModel *model = GTK_TREE_MODEL(notes_store);
-        GtkTreeIter iter;
-        if (gtk_tree_model_get_iter_first(model, &iter)) {
-            GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
-            GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
-            gtk_tree_selection_select_path(sel, path);
-            gtk_tree_view_set_cursor(GTK_TREE_VIEW(tree), path, NULL, FALSE);
-            gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(tree), path, NULL, TRUE, 0.5, 0.0);
-            gtk_tree_path_free(path);
-        }
-    }
-}
+
 static void on_add_save_clicked(GtkButton *btn, gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
     if (!ed) return;
@@ -1182,10 +1254,10 @@ static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer us
 }
 
 static gboolean on_window_focus_in(GtkWidget *widget, GdkEventFocus *event, gpointer user_data) {
-    /* Reload notes list when main window gains focus */
-    if (notes_store && search_entry) {
-        app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
-        select_first_note_row();
+    /* Just restore the last selected note, don't reload the list */
+    /* (reloading would re-sort and change positions) */
+    if (notes_store && tree) {
+        select_last_or_first_note();
     }
     return FALSE; /* propagate event */
 }
@@ -1251,12 +1323,16 @@ static GtkWidget* create_main_window(void) {
     g_signal_connect(tree, "button-press-event", G_CALLBACK(on_tree_button_press), NULL);
     g_signal_connect(tree, "row-activated", G_CALLBACK(on_row_activated), NULL);
 
+    // Connect selection changed to save last note immediately
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+    g_signal_connect(sel, "changed", G_CALLBACK(on_selection_changed), NULL);
+
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_container_add(GTK_CONTAINER(scroll), tree);
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
 
     /* Make sure first row is selected when the main window appears */
-    select_first_note_row();
+    select_last_or_first_note();
 
     return win;
 }

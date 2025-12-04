@@ -536,6 +536,8 @@ void app_save_window_position(int x, int y) {
     g_free(path);
 }
 
+
+
 // Delete a note by title (without .txt). Returns 1 on success, 0 on error.
 int app_delete_note(const char *title) {
     char *notes_dir = get_notes_dir();
