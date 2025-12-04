@@ -22,6 +22,8 @@ static GtkWidget *clear_btn = NULL;
 static GtkListStore *notes_store = NULL;
 static GtkWidget *tree = NULL;
 static AppIndicator *indicator = NULL;
+static int current_x = -1;
+static int current_y = -1;
 
 // Napoved funkcij
 static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data);
@@ -859,7 +861,13 @@ static gboolean on_wrap_label_button_press(GtkWidget *widget, GdkEventButton *ev
 // Called in main thread via g_idle_add to bring window to front
 static gboolean bring_main_window(gpointer user_data) {
     if (main_window) {
-        if (!gtk_widget_get_visible(main_window)) gtk_widget_show_all(main_window);
+        if (!gtk_widget_get_visible(main_window)) {
+            int x = -1, y = -1;
+            if (app_read_window_position(&x, &y) && x >= 0 && y >= 0) {
+                gtk_window_move(GTK_WINDOW(main_window), x, y);
+            }
+            gtk_widget_show_all(main_window);
+        }
         /* Select first note row when window is shown */
         select_first_note_row();
         gtk_window_present(GTK_WINDOW(main_window));
@@ -890,13 +898,22 @@ static void *instance_server_thread(void *arg) {
 
 static void on_show_hide(GtkMenuItem *item, gpointer user_data) {
     if (gtk_widget_get_visible(main_window)) {
+        // Save position before hiding
+        if (current_x != -1 && current_y != -1) {
+            app_save_window_position(current_x, current_y);
+        } else {
+            int x, y;
+            gtk_window_get_position(GTK_WINDOW(main_window), &x, &y);
+            app_save_window_position(x, y);
+        }
         gtk_widget_hide(main_window);
     } else {
+        /* app_load_notes will be called by focus-in-event handler */
+        /* Apply saved position BEFORE showing */
         int x = -1, y = -1;
         if (app_read_window_position(&x, &y) && x >= 0 && y >= 0) {
             gtk_window_move(GTK_WINDOW(main_window), x, y);
         }
-        /* app_load_notes will be called by focus-in-event handler */
         gtk_widget_show_all(main_window);
         /* Select first note row after loading notes */
         select_first_note_row();
@@ -1146,10 +1163,21 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     gtk_widget_show_all(dlg);
 }
 
+static gboolean on_configure_event(GtkWidget *widget, GdkEventConfigure *event, gpointer user_data) {
+    if (gtk_widget_get_visible(widget)) {
+        gtk_window_get_position(GTK_WINDOW(widget), &current_x, &current_y);
+    }
+    return FALSE;
+}
+
 static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data) {
-    int x, y;
-    gtk_window_get_position(GTK_WINDOW(widget), &x, &y);
-    app_save_window_position(x, y);
+    if (current_x != -1 && current_y != -1) {
+        app_save_window_position(current_x, current_y);
+    } else {
+        int x, y;
+        gtk_window_get_position(GTK_WINDOW(widget), &x, &y);
+        app_save_window_position(x, y);
+    }
     gtk_widget_hide(widget);
     return TRUE; // prepreči uničenje
 }
@@ -1166,6 +1194,8 @@ static GtkWidget* create_main_window(void) {
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), "baNotes");
     gtk_window_set_default_size(GTK_WINDOW(win), 500, 600);
+    gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_NONE);
+    g_signal_connect(win, "configure-event", G_CALLBACK(on_configure_event), NULL);
     g_signal_connect(win, "delete-event", G_CALLBACK(on_window_delete), NULL);
     g_signal_connect(win, "focus-in-event", G_CALLBACK(on_window_focus_in), NULL);
 
@@ -1338,6 +1368,9 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+
+    // Force X11 backend to allow window positioning (not supported on Wayland)
+    gdk_set_allowed_backends("x11");
 
     gtk_init(&argc, &argv);
     /* Ensure WM_CLASS matches desktop file (StartupWMClass) */
