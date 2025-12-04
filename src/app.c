@@ -89,9 +89,34 @@ int app_read_word_wrap(int *enabled) {
 void app_save_word_wrap(int enabled) {
     char *path = get_settings_path();
     if (!path) return;
+    
+    // Read existing window position if any
+    int win_x = -1, win_y = -1;
+    FILE *rf = fopen(path, "r");
+    if (rf) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), rf)) {
+            size_t l = strlen(buf);
+            while (l > 0 && (buf[l-1] == '\n' || buf[l-1] == '\r')) buf[--l] = '\0';
+            char *s = buf;
+            while (*s && isspace((unsigned char)*s)) s++;
+            if (strncmp(s, "window_x=", 9) == 0) {
+                win_x = atoi(s + 9);
+            } else if (strncmp(s, "window_y=", 9) == 0) {
+                win_y = atoi(s + 9);
+            }
+        }
+        fclose(rf);
+    }
+    
+    // Write all settings
     FILE *f = fopen(path, "w");
     if (!f) { g_free(path); return; }
     fprintf(f, "wrap=%d\n", enabled ? 1 : 0);
+    if (win_x >= 0 && win_y >= 0) {
+        fprintf(f, "window_x=%d\n", win_x);
+        fprintf(f, "window_y=%d\n", win_y);
+    }
     fclose(f);
     g_free(path);
     app_word_wrap_enabled = enabled ? 1 : 0;
@@ -469,14 +494,46 @@ void app_sort_notes(GtkListStore *store) {
 
 // --- Window position settings ---
 int app_read_window_position(int *x, int *y) {
-    (void)x; (void)y;
-    /* Window position persistence disabled; always report failure. */
-    return 0;
+    if (!x || !y) return 0;
+    char *path = get_settings_path();
+    if (!path) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) { g_free(path); return 0; }
+    char buf[256];
+    int found_x = 0, found_y = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t l = strlen(buf);
+        while (l > 0 && (buf[l-1] == '\n' || buf[l-1] == '\r')) buf[--l] = '\0';
+        char *s = buf;
+        while (*s && isspace((unsigned char)*s)) s++;
+        if (strncmp(s, "window_x=", 9) == 0) {
+            *x = atoi(s + 9);
+            found_x = 1;
+        } else if (strncmp(s, "window_y=", 9) == 0) {
+            *y = atoi(s + 9);
+            found_y = 1;
+        }
+    }
+    fclose(f);
+    g_free(path);
+    return (found_x && found_y) ? 1 : 0;
 }
 
 void app_save_window_position(int x, int y) {
-    (void)x; (void)y;
-    /* No-op: do not write any settings file. */
+    char *path = get_settings_path();
+    if (!path) return;
+    
+    // Read existing settings
+    int wrap = app_word_wrap_enabled;
+    
+    // Write all settings
+    FILE *f = fopen(path, "w");
+    if (!f) { g_free(path); return; }
+    fprintf(f, "wrap=%d\n", wrap);
+    fprintf(f, "window_x=%d\n", x);
+    fprintf(f, "window_y=%d\n", y);
+    fclose(f);
+    g_free(path);
 }
 
 // Delete a note by title (without .txt). Returns 1 on success, 0 on error.
