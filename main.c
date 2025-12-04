@@ -658,6 +658,26 @@ static void on_clear_formatting_clicked(GtkButton *btn, gpointer user_data) {
     if (ed->tview) gtk_widget_grab_focus(ed->tview);
 }
 
+static void open_url_from_selection(EditorData *ed) {
+    if (!ed || !ed->buffer) return;
+    GtkTextIter start, end;
+    if (gtk_text_buffer_get_selection_bounds(ed->buffer, &start, &end)) {
+        char *text = gtk_text_buffer_get_text(ed->buffer, &start, &end, FALSE);
+        if (text) {
+            // Check if it looks like a URL
+            if (g_str_has_prefix(text, "http://") || g_str_has_prefix(text, "https://")) {
+                GError *err = NULL;
+                gtk_show_uri_on_window(GTK_WINDOW(ed->window), text, GDK_CURRENT_TIME, &err);
+                if (err) {
+                    g_printerr("Error opening URL: %s\n", err->message);
+                    g_error_free(err);
+                }
+            }
+            g_free(text);
+        }
+    }
+}
+
 static gboolean on_textview_keypress_rich(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
     /* user_data is EditorData* */
     EditorData *ed = (EditorData*)user_data;
@@ -691,6 +711,10 @@ static gboolean on_textview_keypress_rich(GtkWidget *widget, GdkEventKey *event,
     if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_y || event->keyval == GDK_KEY_Y)) {
         if (ed) editor_redo(ed);
         if (ed && ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
+        return TRUE;
+    }
+    if ((event->state & GDK_CONTROL_MASK) && (event->keyval == GDK_KEY_e || event->keyval == GDK_KEY_E)) {
+        if (ed) open_url_from_selection(ed);
         return TRUE;
     }
     return FALSE;
