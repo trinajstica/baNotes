@@ -32,6 +32,8 @@ static void on_show_hide(GtkMenuItem *item, gpointer user_data);
 static void on_search_changed(GtkEntry *entry, gpointer user_data);
 static void on_clear_clicked(GtkButton *btn, gpointer user_data);
 static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data);
+static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data);
+static void show_main_window(void);
 static GtkWidget* create_main_window(void);
 static void create_tray_icon(void);
 static void editor_destroy(GtkWidget *w, gpointer user_data);
@@ -858,23 +860,27 @@ static gboolean on_wrap_label_button_press(GtkWidget *widget, GdkEventButton *ev
     return FALSE;
 }
 
+// Helper to show main window, position it, and ensure it is focused/on-top
+static void show_main_window(void) {
+    if (!main_window) return;
+    if (!gtk_widget_get_visible(main_window)) {
+        int x = -1, y = -1;
+        if (app_read_window_position(&x, &y) && x >= 0 && y >= 0) {
+            gtk_window_move(GTK_WINDOW(main_window), x, y);
+        }
+        gtk_widget_show_all(main_window);
+    }
+    /* Select first note row when window is shown */
+    select_first_note_row();
+    gtk_window_present(GTK_WINDOW(main_window));
+    gtk_window_set_keep_above(GTK_WINDOW(main_window), TRUE);
+    gtk_window_set_focus_on_map(GTK_WINDOW(main_window), TRUE);
+    gtk_widget_grab_focus(main_window);
+}
+
 // Called in main thread via g_idle_add to bring window to front
 static gboolean bring_main_window(gpointer user_data) {
-    if (main_window) {
-        if (!gtk_widget_get_visible(main_window)) {
-            int x = -1, y = -1;
-            if (app_read_window_position(&x, &y) && x >= 0 && y >= 0) {
-                gtk_window_move(GTK_WINDOW(main_window), x, y);
-            }
-            gtk_widget_show_all(main_window);
-        }
-        /* Select first note row when window is shown */
-        select_first_note_row();
-        gtk_window_present(GTK_WINDOW(main_window));
-        gtk_window_set_keep_above(GTK_WINDOW(main_window), TRUE);
-        gtk_window_set_focus_on_map(GTK_WINDOW(main_window), TRUE);
-        gtk_widget_grab_focus(main_window);
-    }
+    show_main_window();
     return FALSE; // run once
 }
 
@@ -912,17 +918,7 @@ static void on_show_hide(GtkMenuItem *item, gpointer user_data) {
         gtk_widget_hide(main_window);
     } else {
         /* app_load_notes will be called by focus-in-event handler */
-        /* Apply saved position BEFORE showing */
-        int x = -1, y = -1;
-        if (app_read_window_position(&x, &y) && x >= 0 && y >= 0) {
-            gtk_window_move(GTK_WINDOW(main_window), x, y);
-        }
-        gtk_widget_show_all(main_window);
-        /* Select first note row after loading notes */
-        select_first_note_row();
-        // Bring to front and focus
-        gtk_window_present(GTK_WINDOW(main_window));
-        gtk_widget_grab_focus(main_window);
+        show_main_window();
     }
 }
 
