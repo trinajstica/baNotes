@@ -137,6 +137,17 @@ static void on_selection_changed(GtkTreeSelection *selection, gpointer data) {
     }
 }
 
+// Helper: reload notes while blocking selection signal to preserve last_selected_note
+static void reload_notes_safely(const char *filter) {
+    if (!tree || !notes_store) return;
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+    // Block the signal so on_selection_changed isn't triggered by clearing/refilling the list
+    g_signal_handlers_block_by_func(sel, G_CALLBACK(on_selection_changed), NULL);
+    app_load_notes(notes_store, filter);
+    g_signal_handlers_unblock_by_func(sel, G_CALLBACK(on_selection_changed), NULL);
+}
+
+
 // Handler: klik na tree view - preveri, če je klik na stolpcu smeti
 static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
     if (event->type != GDK_BUTTON_PRESS || event->button != 1) return FALSE;
@@ -213,7 +224,7 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
                     if (resp == GTK_RESPONSE_YES) {
                         if (app_delete_note(title)) {
                             // Reload notes
-                            app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
+                            reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
                             // Restore selection if we remembered one and the list is not empty
                             if (saved_index >= 0 && tree && notes_store) {
                                 GtkTreeModel *model = GTK_TREE_MODEL(notes_store);
@@ -342,7 +353,7 @@ static void on_editor_save_clicked(GtkButton *btn, gpointer user_data) {
             g_free(ed->title);
             ed->title = g_strdup(new_title);
             // refresh list
-            app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
+            reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
         }
 
         // Zapiši vsebino v datoteko (uporabi trenutno ed->title)
@@ -952,7 +963,7 @@ static void show_main_window(void) {
     
     /* Refresh notes list when showing window */
     if (notes_store && search_entry) {
-        app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
+        reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
     }
     
     /* Select last note row when window is shown */
@@ -1014,12 +1025,12 @@ static void on_quit(GtkMenuItem *item, gpointer user_data) {
 
 static void on_search_changed(GtkEntry *entry, gpointer user_data) {
     const char *text = gtk_entry_get_text(entry);
-    app_load_notes(notes_store, text);
+    reload_notes_safely(text);
 }
 
 static void on_clear_clicked(GtkButton *btn, gpointer user_data) {
     gtk_entry_set_text(GTK_ENTRY(search_entry), "");
-    app_load_notes(notes_store, "");
+    reload_notes_safely("");
         /* Select first note if it exists */
     if (tree && notes_store) {
         GtkTreeModel *model = GTK_TREE_MODEL(notes_store);
@@ -1208,7 +1219,7 @@ static void on_add_save_clicked(GtkButton *btn, gpointer user_data) {
         app_write_note(unique, ser);
         g_free(ser);
         // Refresh list
-        app_load_notes(notes_store, gtk_entry_get_text(GTK_ENTRY(search_entry)));
+        reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
         g_free(unique);
         g_free(title);
     }
