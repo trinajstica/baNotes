@@ -21,6 +21,12 @@ Usage
 
 - Run `baNotes` after installation or start from your desktop environment. The app stores notes in `.txt` files located in a user configuration directory. Files are either plain text or encoded in the BA-RICH-V1 "enriched" format (used to persist editor formatting).
 
+Screenshots
+
+- ![baNotes - main window](images/pic1.png)
+- ![baNotes - note editor](images/pic2.png)
+- ![baNotes - tray indicator](images/pic3.png)
+
 License
 
 This project is licensed under the MIT License. See `LICENSE` for details.
