@@ -30,9 +30,10 @@ done
 REQUIRED_PKG_MODULES=("gtk+-3.0" "ayatana-appindicator3-0.1")
 
 # Map pkg-config modules to candidate Solus package names (order: preferred -> fallback)
+# Prefer '-devel' packages which provide headers and .pc files for development
 declare -A CANDIDATES
-CANDIDATES["gtk+-3.0"]="gtk+3 gtk3 gtk+-3"
-CANDIDATES["ayatana-appindicator3-0.1"]="ayatana-appindicator libayatana-appindicator ayatana-appindicator3"
+CANDIDATES["gtk+-3.0"]="libgtk-3-devel libgtk-3 gtk+3 gtk3 gtk+-3"
+CANDIDATES["ayatana-appindicator3-0.1"]="libayatana-appindicator-devel libayatana-appindicator ayatana-appindicator3"
 
 PKGS_TO_INSTALL=()
 
