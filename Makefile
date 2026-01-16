@@ -28,10 +28,14 @@ install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
 
-	# Install desktop entry
+	# Install desktop entry (set Exec to install location)
 	if [ -f baNotes.desktop ]; then \
 		install -d $(DESTDIR)$(DESKTOPDIR); \
-		install -m 0644 baNotes.desktop $(DESTDIR)$(DESKTOPDIR)/baNotes.desktop; \
+		# Create a temporary desktop file with Exec set to the installed binary path; \
+		tmp=$$(mktemp); \
+		sed 's|^Exec=.*|Exec=$(BINDIR)/$(TARGET)|' baNotes.desktop > $$tmp; \
+		install -m 0644 $$tmp $(DESTDIR)$(DESKTOPDIR)/baNotes.desktop; \
+		rm -f $$tmp; \
 	fi
 
 	# Note: we prefer SVG icons; PNG icon support removed
