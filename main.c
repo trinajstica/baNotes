@@ -1,5 +1,5 @@
 /* Application version — update here when releasing */
-#define VERZIJA "baNotes v1.00"
+#define VERZIJA "baNotes v1.02"
 
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
@@ -50,6 +50,8 @@ static void on_fg_color_set(GtkColorButton *cbtn, gpointer user_data);
 static void on_bg_color_set(GtkColorButton *cbtn, gpointer user_data);
 static GtkWidget *create_rich_toolbar_for_editor(EditorData *ed);
 static void on_insert_text(GtkTextBuffer *buffer, GtkTextIter *location, gchar *text, gint len, gpointer user_data);
+static void on_buffer_changed(GtkTextBuffer *buffer, gpointer user_data);
+static void apply_app_css(void);
 // single-instance socket path
 static char socket_path[4096] = {0};
 static int server_sock = -1;
@@ -63,7 +65,7 @@ static void cleanup_socket(void) {
     if (server_sock != -1) close(server_sock);
     if (socket_path[0]) unlink(socket_path);
 }
-static void on_editor_save_clicked(GtkButton *btn, gpointer user_data);
+static void editor_autosave(EditorData *ed);
 static char *first_nonempty_line(const char *text);
 static GtkWidget* create_editor_dialog(const char *window_title, const char *note_title, GtkTextBuffer *existing_buffer);
 
@@ -89,6 +91,8 @@ struct EditorData {
     int max_history;
     gboolean ignore_changes;
     guint debounce_timer; /* timer id for grouping keypress snapshots */
+    guint autosave_timer; /* timer id for autosave debounce */
+    gboolean dirty;       /* buffer changed since last successful autosave */
 };
 
 static char *sanitize_title(const char *s) {
@@ -116,6 +120,22 @@ static char *sanitize_title(const char *s) {
         snprintf(out, len + 1 + 32, "untitled_%ld", (long)t);
     }
     return out;
+}
+
+static gboolean note_file_exists(const char *title) {
+    if (!title) return FALSE;
+    const char *home = getenv("HOME");
+    if (!home) return FALSE;
+    gchar *notes_dir = g_build_filename(home, CONFIG_DIR, NOTES_SUBDIR, NULL);
+    gchar *filename = NULL;
+    if (strlen(title) > 4 && strcmp(title + strlen(title) - 4, ".txt") == 0) filename = g_strdup(title);
+    else filename = g_strconcat(title, ".txt", NULL);
+    gchar *path = g_build_filename(notes_dir, filename, NULL);
+    gboolean exists = g_file_test(path, G_FILE_TEST_EXISTS);
+    g_free(path);
+    g_free(filename);
+    g_free(notes_dir);
+    return exists;
 }
 
 // Handler: selection changed
@@ -267,108 +287,72 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
     return FALSE;
 }
 
-// Save the edited note when the "OK" button is clicked
-static void on_editor_save_clicked(GtkButton *btn, gpointer user_data) {
+static gboolean editor_autosave_cb(gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
-    if (!ed) return;
-        GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ed->tview));
-    GtkTextIter start, end;
-    gtk_text_buffer_get_start_iter(buffer, &start);
-    gtk_text_buffer_get_end_iter(buffer, &end);
-    gchar *text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
+    if (!ed) return G_SOURCE_REMOVE;
+    ed->autosave_timer = 0;
+    editor_autosave(ed);
+    return G_SOURCE_REMOVE;
+}
 
-    // Najdi prvo ne-prazno vrstico za naslov
+static void editor_schedule_autosave(EditorData *ed) {
+    if (!ed) return;
+    if (ed->autosave_timer) {
+        g_source_remove(ed->autosave_timer);
+        ed->autosave_timer = 0;
+    }
+    ed->autosave_timer = g_timeout_add(300, editor_autosave_cb, ed);
+}
+
+static void editor_autosave(EditorData *ed) {
+    if (!ed || !ed->buffer) return;
+
+    GtkTextIter start, end;
+    gtk_text_buffer_get_start_iter(ed->buffer, &start);
+    gtk_text_buffer_get_end_iter(ed->buffer, &end);
+    gchar *text = gtk_text_buffer_get_text(ed->buffer, &start, &end, FALSE);
     char *first = first_nonempty_line(text);
-    char *new_title = NULL;
-    if (first && *first) {
-        new_title = sanitize_title(first);
-    } else {
+
+    char *desired_title = NULL;
+    if (first && *first) desired_title = sanitize_title(first);
+    else {
         time_t t = time(NULL);
-        new_title = sanitize_title((char*)g_strdup_printf("untitled_%ld", (long)t));
+        desired_title = g_strdup_printf("untitled_%ld", (long)t);
     }
 
-    if (new_title) {
-        // Če se naslov spremeni, poskusi preimenovati; pri urejanju NE ustvarjam avtomatičnega sufiksa
-        if (g_strcmp0(new_title, ed->title) != 0) {
-            // Preveri, ali ciljna datoteka že obstaja
-            const char *home = getenv("HOME");
-            char notes_dir[4096] = {0};
-            if (home) {
-                gchar *tmp = g_build_filename(home, CONFIG_DIR, NOTES_SUBDIR, NULL);
-                strncpy(notes_dir, tmp, sizeof(notes_dir)-1);
-                notes_dir[sizeof(notes_dir)-1] = '\0';
-                g_free(tmp);
-            }
-            char targetpath[4096];
-            if (strlen(new_title) > 4 && strcmp(new_title + strlen(new_title) - 4, ".txt") == 0) {
-                gchar *tmp2 = g_build_filename(notes_dir, new_title, NULL);
-                strncpy(targetpath, tmp2, sizeof(targetpath)-1);
-                targetpath[sizeof(targetpath)-1] = '\0';
-                g_free(tmp2);
-            } else {
-                gchar *with_ext = g_strconcat(new_title, ".txt", NULL);
-                gchar *tmp2 = g_build_filename(notes_dir, with_ext, NULL);
-                strncpy(targetpath, tmp2, sizeof(targetpath)-1);
-                targetpath[sizeof(targetpath)-1] = '\0';
-                g_free(tmp2);
-                g_free(with_ext);
-            }
-            if (g_file_test(targetpath, G_FILE_TEST_EXISTS)) {
-                char *msg = g_strdup_printf("A file named '%s' already exists. Rename it manually or choose a different title.", new_title);
-                    GtkWidget *err = gtk_dialog_new_with_buttons("File exists",
-                    GTK_WINDOW(ed->window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                    "Ok", GTK_RESPONSE_OK,
-                    NULL);
-                GtkWidget *err_area = gtk_dialog_get_content_area(GTK_DIALOG(err));
-                GtkWidget *err_label = gtk_label_new(msg);
-                gtk_container_add(GTK_CONTAINER(err_area), err_label);
-                gtk_widget_show_all(err);
-                gtk_dialog_run(GTK_DIALOG(err));
-                gtk_widget_destroy(err);
-                g_free(msg);
-                g_free(new_title);
-                if (first) g_free(first);
-                g_free(text);
-                return;
-            }
-            // Poskusi preimenovati
-            if (!app_rename_note(ed->title, new_title)) {
-                char *msg2 = g_strdup_printf("Cannot rename note to '%s'.", new_title);
-                GtkWidget *err = gtk_dialog_new_with_buttons("Rename error",
-                    GTK_WINDOW(ed->window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                    "Ok", GTK_RESPONSE_OK,
-                    NULL);
-                GtkWidget *err_area2 = gtk_dialog_get_content_area(GTK_DIALOG(err));
-                GtkWidget *err_label2 = gtk_label_new(msg2);
-                gtk_container_add(GTK_CONTAINER(err_area2), err_label2);
-                gtk_widget_show_all(err);
-                gtk_dialog_run(GTK_DIALOG(err));
-                gtk_widget_destroy(err);
-                g_free(msg2);
-                g_free(new_title);
-                if (first) g_free(first);
-                g_free(text);
-                return;
-            }
+    if (!ed->title) {
+        char *unique = g_strdup(desired_title);
+        int suffix = 1;
+        while (note_file_exists(unique)) {
+            g_free(unique);
+            unique = g_strdup_printf("%s-%d", desired_title, suffix++);
+        }
+        ed->title = unique;
+        if (last_selected_note) g_free(last_selected_note);
+        last_selected_note = g_strdup(ed->title);
+        reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
+    } else if (g_strcmp0(desired_title, ed->title) != 0) {
+        /* Če cilj že obstaja, obdrži star naslov brez pop-upov med tipkanjem. */
+        if (!note_file_exists(desired_title) && app_rename_note(ed->title, desired_title)) {
             g_free(ed->title);
-            ed->title = g_strdup(new_title);
-            // refresh list
+            ed->title = g_strdup(desired_title);
+            if (last_selected_note) g_free(last_selected_note);
+            last_selected_note = g_strdup(ed->title);
             reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
         }
+    }
 
-        // Zapiši vsebino v datoteko (uporabi trenutno ed->title)
-        char *ser = app_serialize_buffer_rich(buffer);
-        if (!ser) ser = g_strdup(text);
+    if (ed->title) {
+        char *ser = app_serialize_buffer_rich(ed->buffer);
+        if (!ser) ser = g_strdup(text ? text : "");
         app_write_note(ed->title, ser);
+        ed->dirty = FALSE;
         g_free(ser);
-        g_free(new_title);
     }
 
     if (first) g_free(first);
+    g_free(desired_title);
     g_free(text);
-
-    // Close the window (editor_destroy will free EditorData)
-    gtk_widget_destroy(ed->window);
 }
 
 // Push the current buffer snapshot on undo stack
@@ -465,13 +449,6 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
     snprintf(window_title, sizeof(window_title), "Edit: %s", title);
     GtkWidget *dlg = create_editor_dialog(window_title, title, buffer);
     
-    /* Get EditorData and Save button from dialog */
-    EditorData *ed = (EditorData*)g_object_get_data(G_OBJECT(dlg), "editor-data");
-    GtkWidget *save_btn = (GtkWidget*)g_object_get_data(G_OBJECT(dlg), "save-button");
-    
-    /* Connect save button */
-    g_signal_connect(save_btn, "clicked", G_CALLBACK(on_editor_save_clicked), ed);
-
     gtk_widget_show_all(dlg);
     g_free(title);
 }
@@ -480,6 +457,8 @@ static void editor_destroy(GtkWidget *w, gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
     if (!ed) return;
     if (ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
+    if (ed->autosave_timer) { g_source_remove(ed->autosave_timer); ed->autosave_timer = 0; }
+    if (ed->dirty) editor_autosave(ed);
     if (ed->title) g_free(ed->title);
     if (ed->fg_color) g_free(ed->fg_color);
     if (ed->bg_color) g_free(ed->bg_color);
@@ -667,6 +646,22 @@ static void on_redo_clicked(GtkButton *btn, gpointer user_data) { editor_redo((E
 static void on_clear_formatting_clicked(GtkButton *btn, gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
     if (!ed) return;
+    if (ed->buffer) {
+        GtkTextIter s, e;
+        if (gtk_text_buffer_get_selection_bounds(ed->buffer, &s, &e)) {
+            if (ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
+            editor_push_snapshot(ed);
+            gtk_text_buffer_remove_all_tags(ed->buffer, &s, &e);
+        } else {
+            gtk_text_buffer_get_start_iter(ed->buffer, &s);
+            gtk_text_buffer_get_end_iter(ed->buffer, &e);
+            if (!gtk_text_iter_equal(&s, &e)) {
+                if (ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
+                editor_push_snapshot(ed);
+                gtk_text_buffer_remove_all_tags(ed->buffer, &s, &e);
+            }
+        }
+    }
     /* Turn off all formatting modes */
     ed->bold_mode = FALSE;
     ed->italic_mode = FALSE;
@@ -790,6 +785,13 @@ static void on_insert_text(GtkTextBuffer *buffer, GtkTextIter *location, gchar *
     ctx->len = len;
     /* Schedule to run after insertion is done (in main loop) */
     g_idle_add(apply_tags_to_range_idle, ctx);
+}
+
+static void on_buffer_changed(GtkTextBuffer *buffer, gpointer user_data) {
+    EditorData *ed = (EditorData*)user_data;
+    if (!ed) return;
+    ed->dirty = TRUE;
+    editor_schedule_autosave(ed);
 }
 
 static GtkWidget *create_rich_toolbar_for_editor(EditorData *ed) {
@@ -1070,7 +1072,6 @@ static char *first_nonempty_line(const char *text) {
 /* 
  * Create a shared editor dialog window for both add and edit operations.
  * Returns the dialog window. EditorData is attached to window as "editor-data".
- * Save button is attached as "save-button" for caller to connect signal.
  */
 static GtkWidget* create_editor_dialog(const char *window_title, const char *note_title, GtkTextBuffer *existing_buffer) {
     GtkWidget *dlg = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -1079,14 +1080,17 @@ static GtkWidget* create_editor_dialog(const char *window_title, const char *not
     gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(main_window));
     gtk_window_set_position(GTK_WINDOW(dlg), GTK_WIN_POS_CENTER_ON_PARENT);
 
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_container_add(GTK_CONTAINER(dlg), vbox);
-    gtk_widget_set_margin_start(vbox, 5);
-    gtk_widget_set_margin_end(vbox, 5);
+    gtk_widget_set_margin_start(vbox, 12);
+    gtk_widget_set_margin_end(vbox, 12);
+    gtk_widget_set_margin_top(vbox, 12);
+    gtk_widget_set_margin_bottom(vbox, 12);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
     GtkWidget *tview = gtk_text_view_new();
+    gtk_style_context_add_class(gtk_widget_get_style_context(tview), "editor-text");
     gtk_container_add(GTK_CONTAINER(scroll), tview);
     
     GtkWidget *wrap_label = gtk_label_new(app_get_word_wrap() ? "Wrap: ON" : "Wrap: OFF");
@@ -1116,22 +1120,16 @@ static GtkWidget* create_editor_dialog(const char *window_title, const char *not
     ed->fg_color = NULL; ed->bg_color = NULL;
     ed->undo_stack = NULL; ed->redo_stack = NULL; ed->max_history = 128; ed->ignore_changes = FALSE;
     ed->debounce_timer = 0;
+    ed->autosave_timer = 0;
+    ed->dirty = FALSE;
     g_object_set_data(G_OBJECT(dlg), "editor-data", ed);
     editor_push_snapshot(ed);
 
     GtkWidget *toolbar = create_rich_toolbar_for_editor(ed);
     gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
 
-    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
-
-    GtkWidget *save_btn = gtk_button_new_with_label("Save");
-    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
-    gtk_widget_set_margin_bottom(save_btn, 5);
-    gtk_widget_set_margin_end(save_btn, 5);
-    gtk_widget_set_margin_bottom(cancel, 5);
-    gtk_box_pack_start(GTK_BOX(hbox), save_btn, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(hbox), cancel, FALSE, FALSE, 0);
     
     GtkWidget *spacer = gtk_label_new(NULL);
     gtk_widget_set_hexpand(spacer, TRUE);
@@ -1139,108 +1137,19 @@ static GtkWidget* create_editor_dialog(const char *window_title, const char *not
     gtk_widget_set_halign(wrap_eventbox, GTK_ALIGN_END);
     gtk_box_pack_end(GTK_BOX(hbox), wrap_eventbox, FALSE, FALSE, 0);
 
-    g_object_set_data(G_OBJECT(dlg), "save-button", save_btn);
-    g_signal_connect_swapped(cancel, "clicked", G_CALLBACK(gtk_widget_destroy), dlg);
     g_signal_connect(tview, "key-press-event", G_CALLBACK(on_textview_keypress_rich), ed);
     g_signal_connect(dlg, "destroy", G_CALLBACK(editor_destroy), ed);
     g_signal_connect(ed->buffer, "insert-text", G_CALLBACK(on_insert_text), ed);
+    g_signal_connect(ed->buffer, "changed", G_CALLBACK(on_buffer_changed), ed);
 
     return dlg;
 }
 
 
-static void on_add_save_clicked(GtkButton *btn, gpointer user_data) {
-    EditorData *ed = (EditorData*)user_data;
-    if (!ed) return;
-    GtkTextBuffer *buf = ed->buffer;
-    GtkTextIter start, end;
-    gtk_text_buffer_get_start_iter(buf, &start);
-    gtk_text_buffer_get_end_iter(buf, &end);
-    gchar *text = gtk_text_buffer_get_text(buf, &start, &end, FALSE);
-
-    // Use the first non-empty line as the title
-    char *first = first_nonempty_line(text);
-    char *title = NULL;
-    if (first && *first) {
-        title = sanitize_title(first);
-    } else {
-        time_t t = time(NULL);
-        title = sanitize_title((char*)g_strdup_printf("untitled_%ld", (long)t));
-    }
-
-    if (title) {
-        // Check if a file with the same title already exists; if so, find a unique name by appending -1, -2, ...
-        const char *home = getenv("HOME");
-        char notes_dir[4096] = {0};
-        if (home) {
-            gchar *tmp = g_build_filename(home, CONFIG_DIR, NOTES_SUBDIR, NULL);
-            strncpy(notes_dir, tmp, sizeof(notes_dir)-1);
-            notes_dir[sizeof(notes_dir)-1] = '\0';
-            g_free(tmp);
-        }
-        char path[4096];
-        if (strlen(title) > 4 && strcmp(title + strlen(title) - 4, ".txt") == 0) {
-            gchar *tmp2 = g_build_filename(notes_dir, title, NULL);
-            strncpy(path, tmp2, sizeof(path)-1);
-            path[sizeof(path)-1] = '\0';
-            g_free(tmp2);
-        } else {
-            gchar *with_ext = g_strconcat(title, ".txt", NULL);
-            gchar *tmp2 = g_build_filename(notes_dir, with_ext, NULL);
-            strncpy(path, tmp2, sizeof(path)-1);
-            path[sizeof(path)-1] = '\0';
-            g_free(tmp2);
-            g_free(with_ext);
-        }
-
-        char *unique = g_strdup(title);
-        int suffix = 1;
-        while (g_file_test(path, G_FILE_TEST_EXISTS)) {
-            g_free(unique);
-            unique = g_strdup_printf("%s-%d", title, suffix++);
-            if (strlen(unique) > 4 && strcmp(unique + strlen(unique) - 4, ".txt") == 0) {
-                gchar *tmp3 = g_build_filename(notes_dir, unique, NULL);
-                strncpy(path, tmp3, sizeof(path)-1);
-                path[sizeof(path)-1] = '\0';
-                g_free(tmp3);
-            } else {
-                gchar *u_ext = g_strconcat(unique, ".txt", NULL);
-                gchar *tmp3 = g_build_filename(notes_dir, u_ext, NULL);
-                strncpy(path, tmp3, sizeof(path)-1);
-                path[sizeof(path)-1] = '\0';
-                g_free(tmp3);
-                g_free(u_ext);
-            }
-        }
-
-        // Serialize buffer into our rich format and save note with unique name
-        char *ser = app_serialize_buffer_rich(buf);
-        if (!ser) ser = g_strdup(text);
-        app_write_note(unique, ser);
-        g_free(ser);
-        // Refresh list
-        reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
-        g_free(unique);
-        g_free(title);
-    }
-    if (first) g_free(first);
-    g_free(text);
-
-    /* Close the dialog (editor_destroy will free EditorData) */
-    gtk_widget_destroy(ed->window);
-}
-
 // Handler: '+' button for new note
 static void on_add_clicked(GtkButton *btn, gpointer user_data) {
     /* Create editor dialog for new note (no title, empty buffer) */
     GtkWidget *dlg = create_editor_dialog("New note", NULL, NULL);
-    
-    /* Get EditorData and Save button from dialog */
-    EditorData *ed = (EditorData*)g_object_get_data(G_OBJECT(dlg), "editor-data");
-    GtkWidget *save_btn = (GtkWidget*)g_object_get_data(G_OBJECT(dlg), "save-button");
-    
-    /* Connect save button to add save callback */
-    g_signal_connect(save_btn, "clicked", G_CALLBACK(on_add_save_clicked), ed);
 
     gtk_widget_show_all(dlg);
 }
@@ -1282,34 +1191,47 @@ static GtkWidget* create_main_window(void) {
     g_signal_connect(win, "delete-event", G_CALLBACK(on_window_delete), NULL);
     g_signal_connect(win, "focus-in-event", G_CALLBACK(on_window_focus_in), NULL);
 
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_container_add(GTK_CONTAINER(win), vbox);
-    /* Add 5px margin left/right */
-    gtk_widget_set_margin_start(vbox, 5);
-    gtk_widget_set_margin_end(vbox, 5);
+    gtk_widget_set_name(vbox, "main-root");
+    gtk_widget_set_margin_start(vbox, 14);
+    gtk_widget_set_margin_end(vbox, 14);
+    gtk_widget_set_margin_top(vbox, 14);
+    gtk_widget_set_margin_bottom(vbox, 14);
 
-    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 5);
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_style_context_add_class(gtk_widget_get_style_context(hbox), "topbar");
+    gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
 
     search_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Search notes...");
+    gtk_style_context_add_class(gtk_widget_get_style_context(search_entry), "search-entry");
     g_signal_connect(search_entry, "changed", G_CALLBACK(on_search_changed), NULL);
     gtk_box_pack_start(GTK_BOX(hbox), search_entry, TRUE, TRUE, 0);
 
-    GtkWidget *add_btn = gtk_button_new_with_label("+");
+    GtkWidget *add_btn = gtk_button_new_from_icon_name("list-add", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(add_btn, "New note");
+    gtk_style_context_add_class(gtk_widget_get_style_context(add_btn), "btn-accent");
     g_signal_connect(add_btn, "clicked", G_CALLBACK(on_add_clicked), NULL);
     gtk_box_pack_end(GTK_BOX(hbox), add_btn, FALSE, FALSE, 0);
 
-    clear_btn = gtk_button_new_with_label("Clear");
+    clear_btn = gtk_button_new_from_icon_name("edit-clear-symbolic", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(clear_btn, "Clear search");
+    gtk_style_context_add_class(gtk_widget_get_style_context(clear_btn), "btn-flat");
     g_signal_connect(clear_btn, "clicked", G_CALLBACK(on_clear_clicked), NULL);
     gtk_box_pack_end(GTK_BOX(hbox), clear_btn, FALSE, FALSE, 0);
 
     // Model: 0=title, 1=trash icon
     notes_store = gtk_list_store_new(2, G_TYPE_STRING, GDK_TYPE_PIXBUF);
     tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(notes_store));
+    gtk_style_context_add_class(gtk_widget_get_style_context(tree), "notes-tree");
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), FALSE);
+    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(tree), FALSE);
+    gtk_tree_view_set_activate_on_single_click(GTK_TREE_VIEW(tree), FALSE);
 
     // Title (expandable)
     GtkCellRenderer *renderer_text = gtk_cell_renderer_text_new();
+    g_object_set(renderer_text, "ypad", 8, "xpad", 6, "size-points", 12.0, NULL);
     GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes("Note title", renderer_text, "text", 0, NULL);
     gtk_tree_view_column_set_expand(col, TRUE);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
@@ -1339,6 +1261,8 @@ static GtkWidget* create_main_window(void) {
     g_signal_connect(sel, "changed", G_CALLBACK(on_selection_changed), NULL);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_style_context_add_class(gtk_widget_get_style_context(scroll), "notes-scroll");
+    gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(scroll), GTK_SHADOW_NONE);
     gtk_container_add(GTK_CONTAINER(scroll), tree);
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
 
@@ -1346,6 +1270,31 @@ static GtkWidget* create_main_window(void) {
     select_last_or_first_note();
 
     return win;
+}
+
+static void apply_app_css(void) {
+    GtkCssProvider *css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(css,
+        "window { background-color: @theme_bg_color; }\n"
+        "#main-root { border-radius: 14px; background-color: alpha(@theme_base_color, 0.55); }\n"
+        ".topbar button { min-height: 34px; min-width: 34px; border-radius: 10px; }\n"
+        ".search-entry { min-height: 36px; border-radius: 10px; padding: 0 10px; }\n"
+        ".search-entry:focus { border-color: @theme_selected_bg_color; box-shadow: 0 0 0 2px alpha(@theme_selected_bg_color, 0.25); }\n"
+        ".editor-text { font-size: 12pt; }\n"
+        ".btn-accent { background-color: alpha(@theme_selected_bg_color, 0.9); color: @theme_selected_fg_color; }\n"
+        ".btn-accent:hover { background-color: @theme_selected_bg_color; }\n"
+        ".btn-flat { background-color: alpha(@theme_fg_color, 0.08); }\n"
+        ".btn-flat:hover { background-color: alpha(@theme_fg_color, 0.14); }\n"
+        ".notes-scroll { border-radius: 12px; border: 1px solid alpha(@theme_fg_color, 0.16); background-color: @theme_base_color; }\n"
+        ".notes-tree { background: transparent; }\n"
+        ".notes-tree:selected, .notes-tree row:selected { background: alpha(@theme_selected_bg_color, 0.35); color: @theme_text_color; }\n"
+        ".notes-tree row:hover { background: alpha(@theme_selected_bg_color, 0.14); }\n",
+        -1, NULL);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(css);
 }
 
 static void create_tray_icon(void) {
@@ -1462,12 +1411,7 @@ int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
     /* Ensure WM_CLASS matches desktop file (StartupWMClass) */
     gdk_set_program_class("si.generacija.banotes");
-    // Set global font size 16px
-    GtkCssProvider *css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(css, "* { font-size: 16px; }", -1, NULL);
-    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
-        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_USER);
-    g_object_unref(css);
+    apply_app_css();
 
     app_init_config_dirs();
     main_window = create_main_window();

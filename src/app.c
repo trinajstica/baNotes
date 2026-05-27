@@ -19,8 +19,26 @@ GdkPixbuf *app_get_trash_icon(void) {
     static GdkPixbuf *trash = NULL;
     if (!trash) {
         GtkIconTheme *theme = gtk_icon_theme_get_default();
-        trash = gtk_icon_theme_load_icon(theme, "user-trash-symbolic", 16, 0, NULL);
-        if (!trash) trash = gtk_icon_theme_load_icon(theme, "edit-delete-symbolic", 16, 0, NULL);
+
+        GtkStyleContext *ctx = gtk_style_context_new();
+        GtkWidgetPath *path = gtk_widget_path_new();
+        gtk_widget_path_append_type(path, GTK_TYPE_LABEL);
+        gtk_style_context_set_path(ctx, path);
+        GdkRGBA fg;
+        gtk_style_context_get_color(ctx, GTK_STATE_FLAG_NORMAL, &fg);
+        gtk_widget_path_free(path);
+        g_object_unref(ctx);
+
+        GtkIconInfo *info = gtk_icon_theme_lookup_icon(theme, "user-trash-symbolic", 16, GTK_ICON_LOOKUP_FORCE_SYMBOLIC);
+        if (!info) info = gtk_icon_theme_lookup_icon(theme, "edit-delete-symbolic", 16, GTK_ICON_LOOKUP_FORCE_SYMBOLIC);
+        if (info) {
+            gboolean was_symbolic = FALSE;
+            trash = gtk_icon_info_load_symbolic(info, &fg, NULL, NULL, NULL, &was_symbolic, NULL);
+            g_object_unref(info);
+        }
+
+        if (!trash) trash = gtk_icon_theme_load_icon(theme, "user-trash-symbolic", 16, GTK_ICON_LOOKUP_FORCE_SYMBOLIC, NULL);
+        if (!trash) trash = gtk_icon_theme_load_icon(theme, "edit-delete-symbolic", 16, GTK_ICON_LOOKUP_FORCE_SYMBOLIC, NULL);
         if (!trash) trash = gtk_icon_theme_load_icon(theme, "user-trash", 16, 0, NULL);
     }
     return trash;
