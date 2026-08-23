@@ -43,6 +43,27 @@ GdkPixbuf *app_get_trash_icon(void) {
     }
     return trash;
 }
+
+GdkPixbuf *app_get_folder_icon(void) {
+    static GdkPixbuf *folder = NULL;
+    if (!folder) {
+        GtkIconTheme *theme = gtk_icon_theme_get_default();
+        folder = gtk_icon_theme_load_icon(theme, "folder-symbolic", 16, 0, NULL);
+        if (!folder) folder = gtk_icon_theme_load_icon(theme, "folder", 16, 0, NULL);
+    }
+    return folder;
+}
+
+GdkPixbuf *app_get_parent_icon(void) {
+    static GdkPixbuf *parent = NULL;
+    if (!parent) {
+        GtkIconTheme *theme = gtk_icon_theme_get_default();
+        parent = gtk_icon_theme_load_icon(theme, "go-up-symbolic", 16, 0, NULL);
+        if (!parent) parent = gtk_icon_theme_load_icon(theme, "go-up", 16, 0, NULL);
+        if (!parent) parent = app_get_folder_icon();
+    }
+    return parent;
+}
 #include "../include/app.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +85,41 @@ static char *get_notes_dir(void) {
     strncpy(path, tmp, sizeof(path)-1);
     path[sizeof(path)-1] = '\0';
     g_free(tmp);
+    return path;
+}
+
+/* All paths exposed to the UI are relative to the notes directory. */
+static gboolean valid_relative_path(const char *path) {
+    if (!path || !*path || path[0] == '/' || path[0] == '\\') return path && !*path;
+    gchar **parts = g_strsplit_set(path, "/\\", -1);
+    gboolean valid = TRUE;
+    for (gint i = 0; parts && parts[i]; ++i) {
+        if (!*parts[i] || g_strcmp0(parts[i], ".") == 0 || g_strcmp0(parts[i], "..") == 0) {
+            valid = FALSE;
+            break;
+        }
+    }
+    g_strfreev(parts);
+    return valid;
+}
+
+static gchar *build_note_path(const char *title) {
+    if (!title || !valid_relative_path(title)) return NULL;
+    char *notes_dir = get_notes_dir();
+    if (!notes_dir) return NULL;
+    gchar *filename = (strlen(title) > 4 && strcmp(title + strlen(title) - 4, ".txt") == 0)
+        ? g_strdup(title) : g_strconcat(title, ".txt", NULL);
+    gchar *path = g_build_filename(notes_dir, filename, NULL);
+    g_free(filename);
+    return path;
+}
+
+static gchar *build_folder_path(const char *folder) {
+    if (!folder || !*folder) return g_strdup(get_notes_dir());
+    if (!valid_relative_path(folder)) return NULL;
+    char *notes_dir = get_notes_dir();
+    if (!notes_dir) return NULL;
+    gchar *path = g_build_filename(notes_dir, folder, NULL);
     return path;
 }
 
@@ -404,7 +460,7 @@ void app_init_config_dirs(void) {
     strncpy(config_path, tmp, sizeof(config_path)-1);
     config_path[sizeof(config_path)-1] = '\0';
     g_free(tmp);
-    mkdir(config_path, 0700);
+    g_mkdir_with_parents(config_path, 0700);
     gchar *tmp2 = g_build_filename(config_path, NOTES_SUBDIR, NULL);
     char notes_path[4096];
     strncpy(notes_path, tmp2, sizeof(notes_path)-1);
@@ -431,63 +487,358 @@ static int note_cmp(const void *a, const void *b) {
     return (nb->mtime - na->mtime);
 }
 
-void app_load_notes(GtkListStore *store, const char *filter) {
+static GList *get_child_folder_names(const char *parent_path) {
+    GDir *dir = g_dir_open(parent_path, 0, NULL);
+    if (!dir) return NULL;
+    GList *names = NULL;
+    const gchar *name;
+    while ((name = g_dir_read_name(dir))) {
+        gchar *child_path = g_build_filename(parent_path, name, NULL);
+        if (g_file_test(child_path, G_FILE_TEST_IS_DIR))
+            names = g_list_insert_sorted(names, g_strdup(name),
+                (GCompareFunc)g_ascii_strcasecmp);
+        g_free(child_path);
+    }
+    g_dir_close(dir);
+    return names;
+}
+
+static gboolean search_text_matches(const char *text, const char *query_folded) {
+    if (!text || !query_folded || !*query_folded) return FALSE;
+    gchar *folded = g_utf8_casefold(text, -1);
+    gboolean matches = folded && g_strstr_len(folded, -1, query_folded) != NULL;
+    g_free(folded);
+    return matches;
+}
+
+static gboolean search_file_content_matches(const char *path, const char *query_folded) {
+    gchar *content = NULL;
+    gsize length = 0;
+    if (!g_file_get_contents(path, &content, &length, NULL)) return FALSE;
+    gboolean matches = FALSE;
+    const char *header = "BA-RICH-V1\n";
+    if (length > strlen(header) && g_str_has_prefix(content, header)) {
+        const char *encoded = content + strlen(header);
+        const char *newline = strchr(encoded, '\n');
+        if (newline) {
+            gchar *base64 = g_strndup(encoded, (gsize)(newline - encoded));
+            gsize decoded_length = 0;
+            guchar *decoded = g_base64_decode(base64, &decoded_length);
+            if (decoded) {
+                gchar *plain = g_strndup((const char *)decoded, decoded_length);
+                matches = search_text_matches(plain, query_folded);
+                g_free(plain);
+                g_free(decoded);
+            }
+            g_free(base64);
+        }
+    } else {
+        matches = search_text_matches(content, query_folded);
+    }
+    g_free(content);
+    return matches;
+}
+
+struct search_context {
+    const char *query_folded;
+    GList *folders;
+    struct note_entry *notes;
+    size_t note_count;
+};
+
+static gboolean collect_search_results(struct search_context *ctx, const char *folder) {
+    gchar *folder_path = build_folder_path(folder);
+    if (!folder_path) return FALSE;
+    GDir *dir = g_dir_open(folder_path, 0, NULL);
+    if (!dir) {
+        g_free(folder_path);
+        return FALSE;
+    }
+
+    gboolean has_match = FALSE;
+    const gchar *name;
+    while ((name = g_dir_read_name(dir))) {
+        gchar *child_path = g_build_filename(folder_path, name, NULL);
+        if (g_file_test(child_path, G_FILE_TEST_IS_DIR)) {
+            gchar *child_folder = (folder && *folder)
+                ? g_build_filename(folder, name, NULL) : g_strdup(name);
+            gboolean folder_name_matches = search_text_matches(name, ctx->query_folded);
+            gboolean descendant_matches = collect_search_results(ctx, child_folder);
+            if (folder_name_matches || descendant_matches) {
+                ctx->folders = g_list_append(ctx->folders, g_strdup(child_folder));
+                has_match = TRUE;
+            }
+            g_free(child_folder);
+        } else if (g_file_test(child_path, G_FILE_TEST_IS_REGULAR)) {
+            const char *dot = strrchr(name, '.');
+            size_t base_len = dot && strcmp(dot, ".txt") == 0
+                ? (size_t)(dot - name) : strlen(name);
+            gchar *title = g_strndup(name, base_len);
+            gchar *relative = (folder && *folder)
+                ? g_build_filename(folder, title, NULL) : g_strdup(title);
+            gboolean title_matches = search_text_matches(relative, ctx->query_folded);
+            if (title_matches || search_file_content_matches(child_path, ctx->query_folded)) {
+                ctx->notes = realloc(ctx->notes,
+                    sizeof(*ctx->notes) * (ctx->note_count + 1));
+                ctx->notes[ctx->note_count].filename = relative;
+                ctx->notes[ctx->note_count].mtime = get_file_mtime(child_path);
+                ctx->note_count++;
+                has_match = TRUE;
+            } else {
+                g_free(relative);
+            }
+            g_free(title);
+        }
+        g_free(child_path);
+    }
+    g_dir_close(dir);
+    g_free(folder_path);
+    return has_match;
+}
+
+static int search_folder_cmp(const void *a, const void *b) {
+    const char *aa = a;
+    const char *bb = b;
+    int depth_a = 0, depth_b = 0;
+    for (const char *p = aa; *p; ++p) if (*p == '/') depth_a++;
+    for (const char *p = bb; *p; ++p) if (*p == '/') depth_b++;
+    if (depth_a != depth_b) return depth_a - depth_b;
+    return g_ascii_strcasecmp(aa, bb);
+}
+
+static gchar *display_path_from_folder(const char *path, const char *base_folder) {
+    if (base_folder && *base_folder) {
+        gsize base_len = strlen(base_folder);
+        if (g_str_has_prefix(path, base_folder) && path[base_len] == '/')
+            return g_strdup(path + base_len + 1);
+    }
+    return g_strdup(path);
+}
+
+static void load_search_results(GtkListStore *store, const char *filter, const char *folder) {
+    gchar *query_folded = g_utf8_casefold(filter, -1);
+    struct search_context ctx = { query_folded, NULL, NULL, 0 };
+    collect_search_results(&ctx, folder ? folder : "");
+    ctx.folders = g_list_sort(ctx.folders, search_folder_cmp);
+
+    if (folder && *folder) {
+        gchar *parent = g_path_get_dirname(folder);
+        if (g_strcmp0(parent, ".") == 0) {
+            g_free(parent);
+            parent = g_strdup("");
+        }
+        GtkTreeIter parent_iter;
+        gtk_list_store_append(store, &parent_iter);
+        gtk_list_store_set(store, &parent_iter,
+            0, "..", 1, app_get_parent_icon(), 2, parent, 3, 2, -1);
+        g_free(parent);
+    }
+
+    for (GList *item = ctx.folders; item; item = item->next) {
+        char *path = item->data;
+        gchar *display = display_path_from_folder(path, folder);
+        GtkTreeIter iter;
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter,
+            0, display, 1, app_get_folder_icon(), 2, path, 3, 1, -1);
+        g_free(display);
+    }
+    g_list_free_full(ctx.folders, g_free);
+
+    if (ctx.note_count > 1)
+        qsort(ctx.notes, ctx.note_count, sizeof(*ctx.notes), note_cmp);
+    GdkPixbuf *trash = app_get_trash_icon();
+    for (size_t i = 0; i < ctx.note_count; ++i) {
+        gchar *display = display_path_from_folder(ctx.notes[i].filename, folder);
+        GtkTreeIter iter;
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter,
+            0, display, 1, trash, 2, ctx.notes[i].filename, 3, 0, -1);
+        g_free(display);
+        free(ctx.notes[i].filename);
+    }
+    free(ctx.notes);
+    g_free(query_folded);
+}
+
+static void append_folder_options(GtkComboBoxText *combo, const char *parent, int depth) {
+    gchar *parent_path = build_folder_path(parent);
+    if (!parent_path) return;
+    GList *names = get_child_folder_names(parent_path);
+    for (GList *item = names; item; item = item->next) {
+        const char *child_name = item->data;
+        gchar *relative = (parent && *parent)
+            ? g_build_filename(parent, child_name, NULL) : g_strdup(child_name);
+        gchar *display = g_strdup_printf("%*s%s", depth * 2, "", child_name);
+        gtk_combo_box_text_append(combo, relative, display);
+        append_folder_options(combo, relative, depth + 1);
+        g_free(display);
+        g_free(relative);
+    }
+    g_list_free_full(names, g_free);
+    g_free(parent_path);
+}
+
+void app_load_folders(GtkComboBoxText *combo) {
+    if (!combo) return;
+    gtk_combo_box_text_remove_all(combo);
+    gtk_combo_box_text_append(combo, "__root__", "All notes");
+    append_folder_options(combo, "", 1);
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(combo), "__root__");
+}
+
+int app_create_folder(const char *parent, const char *name) {
+    if (!name || !*name || strchr(name, '/') || strchr(name, '\\') ||
+        g_strcmp0(name, ".") == 0 || g_strcmp0(name, "..") == 0) return 0;
+    if (parent && *parent && !valid_relative_path(parent)) return 0;
+    gchar *relative = (parent && *parent) ? g_build_filename(parent, name, NULL) : g_strdup(name);
+    gchar *path = build_folder_path(relative);
+    gboolean ok = path && mkdir(path, 0700) == 0;
+    g_free(path);
+    g_free(relative);
+    return ok ? 1 : 0;
+}
+
+static gboolean valid_folder_name(const char *name) {
+    return name && *name && !strchr(name, '/') && !strchr(name, '\\') &&
+        !strchr(name, '\n') && !strchr(name, '\r') &&
+        g_strcmp0(name, ".") != 0 && g_strcmp0(name, "..") != 0;
+}
+
+int app_rename_folder(const char *folder, const char *new_name) {
+    if (!folder || !*folder || !valid_relative_path(folder) || !valid_folder_name(new_name)) return 0;
+    gchar *parent = g_path_get_dirname(folder);
+    if (g_strcmp0(parent, ".") == 0) {
+        g_free(parent);
+        parent = g_strdup("");
+    }
+    gchar *target = (parent && *parent)
+        ? g_build_filename(parent, new_name, NULL) : g_strdup(new_name);
+    gchar *source_path = build_folder_path(folder);
+    gchar *target_path = build_folder_path(target);
+    int result = source_path && target_path &&
+        g_file_test(source_path, G_FILE_TEST_IS_DIR) &&
+        !g_file_test(target_path, G_FILE_TEST_EXISTS) &&
+        rename(source_path, target_path) == 0;
+    g_free(parent);
+    g_free(target);
+    g_free(source_path);
+    g_free(target_path);
+    return result;
+}
+
+int app_folder_is_empty(const char *folder) {
+    if (!folder || !*folder || !valid_relative_path(folder)) return -1;
+    gchar *path = build_folder_path(folder);
+    if (!path) return -1;
+    GDir *dir = g_dir_open(path, 0, NULL);
+    if (!dir) {
+        g_free(path);
+        return -1;
+    }
+    const gchar *name = g_dir_read_name(dir);
+    g_dir_close(dir);
+    g_free(path);
+    return name ? 0 : 1;
+}
+
+static gboolean delete_folder_contents(const char *path) {
+    GDir *dir = g_dir_open(path, 0, NULL);
+    if (!dir) return FALSE;
+    gboolean ok = TRUE;
+    const gchar *name;
+    while (ok && (name = g_dir_read_name(dir))) {
+        gchar *child = g_build_filename(path, name, NULL);
+        gboolean is_real_dir = g_file_test(child, G_FILE_TEST_IS_DIR) &&
+            !g_file_test(child, G_FILE_TEST_IS_SYMLINK);
+        if (is_real_dir) ok = delete_folder_contents(child);
+        else ok = unlink(child) == 0;
+        g_free(child);
+    }
+    g_dir_close(dir);
+    return ok && rmdir(path) == 0;
+}
+
+int app_delete_folder(const char *folder) {
+    if (!folder || !*folder || !valid_relative_path(folder)) return 0;
+    gchar *path = build_folder_path(folder);
+    if (!path) return 0;
+    int result = g_file_test(path, G_FILE_TEST_IS_DIR) && delete_folder_contents(path);
+    g_free(path);
+    return result;
+}
+
+void app_load_notes(GtkListStore *store, const char *filter, const char *folder) {
     gtk_list_store_clear(store);
-    char *notes_dir = get_notes_dir();
+    if (filter && *filter) {
+        load_search_results(store, filter, folder);
+        return;
+    }
+    char *notes_dir = build_folder_path(folder);
+    if (!notes_dir) return;
+
+    /* Navigation and folders are always shown before notes. */
+    if (folder && *folder) {
+        gchar *parent = g_path_get_dirname(folder);
+        if (g_strcmp0(parent, ".") == 0) {
+            g_free(parent);
+            parent = g_strdup("");
+        }
+        GtkTreeIter parent_iter;
+        gtk_list_store_append(store, &parent_iter);
+        gtk_list_store_set(store, &parent_iter,
+            0, "..",
+            1, app_get_parent_icon(),
+            2, parent,
+            3, 2,
+            -1);
+        g_free(parent);
+    }
+
+    GList *child_folders = get_child_folder_names(notes_dir);
+    GdkPixbuf *folder_icon = app_get_folder_icon();
+    for (GList *item = child_folders; item; item = item->next) {
+        const char *folder_name = item->data;
+        gchar *relative = (folder && *folder)
+            ? g_build_filename(folder, folder_name, NULL) : g_strdup(folder_name);
+        GtkTreeIter folder_iter;
+        gtk_list_store_append(store, &folder_iter);
+        gtk_list_store_set(store, &folder_iter,
+            0, folder_name,
+            1, folder_icon,
+            2, relative,
+            3, 1,
+            -1);
+        g_free(relative);
+    }
+    g_list_free_full(child_folders, g_free);
+
     DIR *dir = opendir(notes_dir);
-    if (!dir) return;
+    if (!dir) { g_free(notes_dir); return; }
     struct dirent *entry;
     struct note_entry *notes = NULL;
     size_t count = 0;
     while ((entry = readdir(dir))) {
-        if (entry->d_type != DT_REG) continue;
+        gchar *entry_path = g_build_filename(notes_dir, entry->d_name, NULL);
+        if (!g_file_test(entry_path, G_FILE_TEST_IS_REGULAR)) {
+            g_free(entry_path);
+            continue;
+        }
         char path[4096];
-        gchar *tmp = g_build_filename(notes_dir, entry->d_name, NULL);
-        strncpy(path, tmp, sizeof(path)-1);
+        strncpy(path, entry_path, sizeof(path)-1);
         path[sizeof(path)-1] = '\0';
-        g_free(tmp);
+        g_free(entry_path);
         FILE *f = fopen(path, "r");
         if (!f) continue;
-        int match = 1;
-        if (filter && *filter) {
-            // Read entire file and decode if necessary
-            fseek(f, 0, SEEK_END);
-            long sz = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            char *buf = malloc(sz + 1);
-            if (!buf) { fclose(f); continue; }
-            if (fread(buf, 1, sz, f) != (size_t)sz) { free(buf); fclose(f); continue; }
-            buf[sz] = '\0';
-            char *plain = buf;
-            const char *hdr = "BA-RICH-V1\n";
-            if (sz > (long)strlen(hdr) && strncmp(buf, hdr, strlen(hdr)) == 0) {
-                const char *p = buf + strlen(hdr);
-                const char *nl = strchr(p, '\n');
-                if (nl) {
-                    size_t b64len = (size_t)(nl - p);
-                    char *b64 = g_strndup(p, b64len);
-                    gsize dlen = 0;
-                    guchar *dec = g_base64_decode(b64, &dlen);
-                    free(buf);
-                    plain = g_strndup((const char*)dec, dlen);
-                    g_free(dec);
-                    g_free(b64);
-                }
-            }
-            match = (strstr(plain, filter) != NULL);
-            free(plain);
-            fclose(f);
-            if (!match) continue;
-        } else {
-            fclose(f);
-        }
-        if (!match) continue;
+        fclose(f);
         notes = realloc(notes, sizeof(*notes) * (count+1));
         // Store name without .txt extension
         const char *dot = strrchr(entry->d_name, '.');
         size_t base_len = dot && strcmp(dot, ".txt") == 0 ? (size_t)(dot - entry->d_name) : strlen(entry->d_name);
         char *title = strndup(entry->d_name, base_len);
-        notes[count].filename = title;
+        notes[count].filename = (folder && *folder)
+            ? g_build_filename(folder, title, NULL) : g_strdup(title);
+        free(title);
         notes[count].mtime = get_file_mtime(path);
         count++;
     }
@@ -498,12 +849,15 @@ void app_load_notes(GtkListStore *store, const char *filter) {
         GtkTreeIter iter;
         gtk_list_store_append(store, &iter);
         gtk_list_store_set(store, &iter,
-            0, notes[i].filename,
+            0, strrchr(notes[i].filename, '/') ? strrchr(notes[i].filename, '/') + 1 : notes[i].filename,
             1, trash,
+            2, notes[i].filename,
+            3, 0,
             -1);
         free(notes[i].filename);
     }
     free(notes);
+    g_free(notes_dir);
 }
 
 void app_sort_notes(GtkListStore *store) {
@@ -558,45 +912,62 @@ void app_save_window_position(int x, int y) {
 
 // Delete a note by title (without .txt). Returns 1 on success, 0 on error.
 int app_delete_note(const char *title) {
-    char *notes_dir = get_notes_dir();
-    if (!notes_dir || !title) return 0;
-    char path[4096];
-    if (strlen(title) > 4 && strcmp(title + strlen(title) - 4, ".txt") == 0) {
-        gchar *tmp = g_build_filename(notes_dir, title, NULL);
-        strncpy(path, tmp, sizeof(path)-1);
-        path[sizeof(path)-1] = '\0';
-        g_free(tmp);
-    } else {
-        gchar *with_ext = g_strconcat(title, ".txt", NULL);
-        gchar *tmp = g_build_filename(notes_dir, with_ext, NULL);
-        strncpy(path, tmp, sizeof(path)-1);
-        path[sizeof(path)-1] = '\0';
-        g_free(tmp);
-        g_free(with_ext);
+    gchar *path = build_note_path(title);
+    if (!path) return 0;
+    int result = unlink(path) == 0;
+    g_free(path);
+    return result;
+}
+
+int app_note_exists(const char *title) {
+    gchar *path = build_note_path(title);
+    if (!path) return 0;
+    int result = g_file_test(path, G_FILE_TEST_IS_REGULAR);
+    g_free(path);
+    return result;
+}
+
+int app_move_entry(const char *source, const char *destination_folder, gboolean is_folder) {
+    if (!source || !*source || (destination_folder && !valid_relative_path(destination_folder))) return 0;
+    if (!is_folder && !valid_relative_path(source)) return 0;
+    if (is_folder && !valid_relative_path(source)) return 0;
+
+    const char *destination = destination_folder ? destination_folder : "";
+    if (is_folder && (g_strcmp0(source, destination) == 0 ||
+        (g_str_has_prefix(destination, source) && destination[strlen(source)] == '/'))) {
+        return 0;
     }
-    if (unlink(path) == 0) return 1;
-    return 0;
+
+    gchar *source_path = is_folder ? build_folder_path(source) : build_note_path(source);
+    gchar *base = g_path_get_basename(source);
+    gchar *target_name = is_folder ? g_strdup(base) : g_strconcat(base, ".txt", NULL);
+    gchar *destination_dir = build_folder_path(destination);
+    gchar *destination_path = destination_dir
+        ? g_build_filename(destination_dir, target_name, NULL) : NULL;
+    int result = 0;
+
+    if (source_path && destination_path && destination_dir &&
+        g_file_test(source_path, G_FILE_TEST_EXISTS) &&
+        g_file_test(destination_dir, G_FILE_TEST_IS_DIR) &&
+        !g_file_test(destination_path, G_FILE_TEST_EXISTS) &&
+        rename(source_path, destination_path) == 0) {
+        result = 1;
+    }
+
+    g_free(source_path);
+    g_free(base);
+    g_free(target_name);
+    g_free(destination_dir);
+    g_free(destination_path);
+    return result;
 }
 
 int app_read_note(const char *title, char **out) {
     if (!title || !out) return 0;
-    char *notes_dir = get_notes_dir();
-    if (!notes_dir) return 0;
-    char path[4096];
-    if (strlen(title) > 4 && strcmp(title + strlen(title) - 4, ".txt") == 0) {
-        gchar *tmp = g_build_filename(notes_dir, title, NULL);
-        strncpy(path, tmp, sizeof(path)-1);
-        path[sizeof(path)-1] = '\0';
-        g_free(tmp);
-    } else {
-        gchar *with_ext = g_strconcat(title, ".txt", NULL);
-        gchar *tmp = g_build_filename(notes_dir, with_ext, NULL);
-        strncpy(path, tmp, sizeof(path)-1);
-        path[sizeof(path)-1] = '\0';
-        g_free(tmp);
-        g_free(with_ext);
-    }
+    gchar *path = build_note_path(title);
+    if (!path) return 0;
     FILE *f = fopen(path, "r");
+    g_free(path);
     if (!f) return 0;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
@@ -612,15 +983,13 @@ int app_read_note(const char *title, char **out) {
 
 int app_write_note(const char *title, const char *content) {
     if (!title) return 0;
-    char *notes_dir = get_notes_dir();
-    if (!notes_dir) return 0;
-    char path[4096];
-    if (strlen(title) > 4 && strcmp(title + strlen(title) - 4, ".txt") == 0) {
-        snprintf(path, sizeof(path), "%s/%s", notes_dir, title);
-    } else {
-        snprintf(path, sizeof(path), "%s/%s.txt", notes_dir, title);
-    }
+    gchar *path = build_note_path(title);
+    if (!path) return 0;
+    gchar *parent = g_path_get_dirname(path);
+    g_mkdir_with_parents(parent, 0700);
+    g_free(parent);
     FILE *f = fopen(path, "w");
+    g_free(path);
     if (!f) return 0;
     if (content) fprintf(f, "%s", content);
     fclose(f);
@@ -629,35 +998,15 @@ int app_write_note(const char *title, const char *content) {
 
 int app_rename_note(const char *old_title, const char *new_title) {
     if (!old_title || !new_title) return 0;
-    char *notes_dir = get_notes_dir();
-    if (!notes_dir) return 0;
-    char oldpath[4096], newpath[4096];
-    if (strlen(old_title) > 4 && strcmp(old_title + strlen(old_title) - 4, ".txt") == 0) {
-        gchar *tmp = g_build_filename(notes_dir, old_title, NULL);
-        strncpy(oldpath, tmp, sizeof(oldpath)-1);
-        oldpath[sizeof(oldpath)-1] = '\0';
-        g_free(tmp);
-    } else {
-        gchar *with_ext_old = g_strconcat(old_title, ".txt", NULL);
-        gchar *tmp = g_build_filename(notes_dir, with_ext_old, NULL);
-        strncpy(oldpath, tmp, sizeof(oldpath)-1);
-        oldpath[sizeof(oldpath)-1] = '\0';
-        g_free(tmp);
-        g_free(with_ext_old);
+    gchar *oldpath = build_note_path(old_title);
+    gchar *newpath = build_note_path(new_title);
+    if (!oldpath || !newpath) {
+        g_free(oldpath);
+        g_free(newpath);
+        return 0;
     }
-    if (strlen(new_title) > 4 && strcmp(new_title + strlen(new_title) - 4, ".txt") == 0) {
-        gchar *tmp2 = g_build_filename(notes_dir, new_title, NULL);
-        strncpy(newpath, tmp2, sizeof(newpath)-1);
-        newpath[sizeof(newpath)-1] = '\0';
-        g_free(tmp2);
-    } else {
-        gchar *with_ext_new = g_strconcat(new_title, ".txt", NULL);
-        gchar *tmp2 = g_build_filename(notes_dir, with_ext_new, NULL);
-        strncpy(newpath, tmp2, sizeof(newpath)-1);
-        newpath[sizeof(newpath)-1] = '\0';
-        g_free(tmp2);
-        g_free(with_ext_new);
-    }
-    if (rename(oldpath, newpath) == 0) return 1;
-    return 0;
+    int result = rename(oldpath, newpath) == 0;
+    g_free(oldpath);
+    g_free(newpath);
+    return result;
 }

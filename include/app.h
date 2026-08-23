@@ -8,13 +8,22 @@
 #define NOTES_SUBDIR "notes"
 
 void app_init_config_dirs(void);
-void app_load_notes(GtkListStore *store, const char *filter);
+void app_load_folders(GtkComboBoxText *combo);
+int app_create_folder(const char *parent, const char *name);
+int app_rename_folder(const char *folder, const char *new_name);
+int app_folder_is_empty(const char *folder);
+int app_delete_folder(const char *folder);
+void app_load_notes(GtkListStore *store, const char *filter, const char *folder);
 void app_sort_notes(GtkListStore *store);
 GdkPixbuf *app_get_eye_icon(void);
 GdkPixbuf *app_get_trash_icon(void);
+GdkPixbuf *app_get_folder_icon(void);
+GdkPixbuf *app_get_parent_icon(void);
 
 // Delete a note by title (without .txt). Returns 1 on success, 0 on error.
 int app_delete_note(const char *title);
+int app_note_exists(const char *title);
+int app_move_entry(const char *source, const char *destination_folder, gboolean is_folder);
 
 // Note I/O and rename
 // Reads the entire note into a malloc'd buffer (sets *out). Returns 1 on success.

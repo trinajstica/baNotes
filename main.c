@@ -19,12 +19,26 @@
 static GtkWidget *main_window = NULL;
 static GtkWidget *search_entry = NULL;
 static GtkWidget *clear_btn = NULL;
+static GtkWidget *folder_combo = NULL;
 static GtkListStore *notes_store = NULL;
 static GtkWidget *tree = NULL;
 static AppIndicator *indicator = NULL;
 static int current_x = -1;
 static int current_y = -1;
 static char *last_selected_note = NULL;  // RAM-only: last selected note title
+static char *current_folder = NULL;      // relative folder path, empty means root
+
+typedef struct {
+    char *path;
+    gint kind;
+} DragSource;
+static GList *pending_drag_sources = NULL;
+
+enum NoteRowKind {
+    ROW_NOTE = 0,
+    ROW_FOLDER = 1,
+    ROW_PARENT = 2
+};
 
 // Napoved funkcij
 static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data);
@@ -32,6 +46,16 @@ static void on_quit(GtkMenuItem *item, gpointer user_data);
 static void on_show_hide(GtkMenuItem *item, gpointer user_data);
 static void on_search_changed(GtkEntry *entry, gpointer user_data);
 static void on_clear_clicked(GtkButton *btn, gpointer user_data);
+static void on_folder_changed(GtkComboBox *combo, gpointer user_data);
+static void on_new_folder_clicked(GtkButton *btn, gpointer user_data);
+static gboolean on_tree_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data);
+static void on_drag_data_get(GtkWidget *widget, GdkDragContext *context,
+    GtkSelectionData *selection_data, guint info, guint time, gpointer user_data);
+static void on_drag_end(GtkWidget *widget, GdkDragContext *context, gpointer user_data);
+static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context,
+    gint x, gint y, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data);
+static void on_rename_folder_activate(GtkMenuItem *item, gpointer user_data);
+static void on_delete_folder_activate(GtkMenuItem *item, gpointer user_data);
 static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data);
 static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data);
 static void show_main_window(void);
@@ -48,6 +72,8 @@ static void on_italic_toggled(GtkToggleButton *btn, gpointer user_data);
 static void on_underline_toggled(GtkToggleButton *btn, gpointer user_data);
 static void on_fg_color_set(GtkColorButton *cbtn, gpointer user_data);
 static void on_bg_color_set(GtkColorButton *cbtn, gpointer user_data);
+static void on_buffer_mark_set(GtkTextBuffer *buffer, GtkTextIter *location,
+    GtkTextMark *mark, gpointer user_data);
 static GtkWidget *create_rich_toolbar_for_editor(EditorData *ed);
 static void on_insert_text(GtkTextBuffer *buffer, GtkTextIter *location, gchar *text, gint len, gpointer user_data);
 static void on_buffer_changed(GtkTextBuffer *buffer, gpointer user_data);
@@ -68,6 +94,11 @@ static void cleanup_socket(void) {
 static void editor_autosave(EditorData *ed);
 static char *first_nonempty_line(const char *text);
 static GtkWidget* create_editor_dialog(const char *window_title, const char *note_title, GtkTextBuffer *existing_buffer);
+static void reload_folders(void);
+static void select_last_or_first_note(void);
+static void navigate_to_folder(const char *folder);
+static void folder_text_cell_data_func(GtkTreeViewColumn *column, GtkCellRenderer *renderer,
+    GtkTreeModel *model, GtkTreeIter *iter, gpointer user_data);
 
 // Editor data
 typedef struct EditorData EditorData;
@@ -75,6 +106,7 @@ typedef struct EditorData EditorData;
 // Editor data
 struct EditorData {
     char *title; // brez .txt
+    char *folder; // relative folder for a newly created note
     GtkTextBuffer *buffer;
     GtkWidget *window;
     GtkWidget *tview;
@@ -86,6 +118,8 @@ struct EditorData {
     GtkWidget *bold_btn;
     GtkWidget *italic_btn;
     GtkWidget *underline_btn;
+    GtkWidget *fg_btn;
+    GtkWidget *bg_btn;
     GList *undo_stack; // list of char* snapshots (serialized)
     GList *redo_stack; // list of char* snapshots
     int max_history;
@@ -123,19 +157,7 @@ static char *sanitize_title(const char *s) {
 }
 
 static gboolean note_file_exists(const char *title) {
-    if (!title) return FALSE;
-    const char *home = getenv("HOME");
-    if (!home) return FALSE;
-    gchar *notes_dir = g_build_filename(home, CONFIG_DIR, NOTES_SUBDIR, NULL);
-    gchar *filename = NULL;
-    if (strlen(title) > 4 && strcmp(title + strlen(title) - 4, ".txt") == 0) filename = g_strdup(title);
-    else filename = g_strconcat(title, ".txt", NULL);
-    gchar *path = g_build_filename(notes_dir, filename, NULL);
-    gboolean exists = g_file_test(path, G_FILE_TEST_EXISTS);
-    g_free(path);
-    g_free(filename);
-    g_free(notes_dir);
-    return exists;
+    return title && app_note_exists(title);
 }
 
 // Handler: selection changed
@@ -144,8 +166,9 @@ static void on_selection_changed(GtkTreeSelection *selection, gpointer data) {
     GtkTreeIter iter;
     if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
         gchar *title = NULL;
-        gtk_tree_model_get(model, &iter, 0, &title, -1);
-        if (title) {
+        gint row_kind = ROW_NOTE;
+        gtk_tree_model_get(model, &iter, 2, &title, 3, &row_kind, -1);
+        if (title && row_kind == ROW_NOTE) {
             g_print("DEBUG: on_selection_changed: saving '%s' to RAM\n", title);
             // Save to RAM only
             if (last_selected_note) g_free(last_selected_note);
@@ -163,19 +186,95 @@ static void reload_notes_safely(const char *filter) {
     GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
     // Block the signal so on_selection_changed isn't triggered by clearing/refilling the list
     g_signal_handlers_block_by_func(sel, G_CALLBACK(on_selection_changed), NULL);
-    app_load_notes(notes_store, filter);
+    app_load_notes(notes_store, filter, current_folder);
     g_signal_handlers_unblock_by_func(sel, G_CALLBACK(on_selection_changed), NULL);
+}
+
+static void clear_pending_drag_sources(void) {
+    for (GList *item = pending_drag_sources; item; item = item->next) {
+        DragSource *source = item->data;
+        g_free(source->path);
+        g_free(source);
+    }
+    g_list_free(pending_drag_sources);
+    pending_drag_sources = NULL;
+}
+
+static void capture_pending_drag_sources(GtkTreeView *treeview) {
+    clear_pending_drag_sources();
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(treeview);
+    GtkTreeModel *model = NULL;
+    GList *rows = gtk_tree_selection_get_selected_rows(selection, &model);
+    for (GList *item = rows; item; item = item->next) {
+        GtkTreeIter iter;
+        GtkTreePath *path = item->data;
+        if (gtk_tree_model_get_iter(model, &iter, path)) {
+            gchar *source_path = NULL;
+            gint row_kind = ROW_NOTE;
+            gtk_tree_model_get(model, &iter, 2, &source_path, 3, &row_kind, -1);
+            if (source_path && (row_kind == ROW_NOTE || row_kind == ROW_FOLDER)) {
+                DragSource *source = g_new0(DragSource, 1);
+                source->path = source_path;
+                source->kind = row_kind;
+                pending_drag_sources = g_list_append(pending_drag_sources, source);
+            } else {
+                g_free(source_path);
+            }
+        }
+        gtk_tree_path_free(path);
+    }
+    g_list_free(rows);
 }
 
 
 // Handler: klik na tree view - preveri, če je klik na stolpcu smeti
 static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
-    if (event->type != GDK_BUTTON_PRESS || event->button != 1) return FALSE;
+    if (event->type != GDK_BUTTON_PRESS || (event->button != 1 && event->button != 3)) return FALSE;
     GtkTreeView *treeview = GTK_TREE_VIEW(widget);
     int x = (int)event->x, y = (int)event->y;
     GtkTreePath *path = NULL;
     GtkTreeViewColumn *col = NULL;
     if (gtk_tree_view_get_path_at_pos(treeview, x, y, &path, &col, NULL, NULL)) {
+        if (event->button == 3) {
+            GtkTreeModel *model = gtk_tree_view_get_model(treeview);
+            GtkTreeIter iter;
+            if (gtk_tree_model_get_iter(model, &iter, path)) {
+                gchar *folder = NULL;
+                gint row_kind = ROW_NOTE;
+                gtk_tree_model_get(model, &iter, 2, &folder, 3, &row_kind, -1);
+                if (folder && row_kind == ROW_FOLDER) {
+                    GtkTreeSelection *selection = gtk_tree_view_get_selection(treeview);
+                    gtk_tree_selection_unselect_all(selection);
+                    gtk_tree_selection_select_path(selection, path);
+                    gtk_tree_view_set_cursor(treeview, path, NULL, FALSE);
+
+                    GtkWidget *menu = gtk_menu_new();
+                    g_object_set_data_full(G_OBJECT(menu), "folder-path", folder, g_free);
+                    GtkWidget *rename_item = gtk_menu_item_new_with_label("Rename folder");
+                    GtkWidget *delete_item = gtk_menu_item_new_with_label("Delete folder");
+                    gtk_menu_shell_append(GTK_MENU_SHELL(menu), rename_item);
+                    gtk_menu_shell_append(GTK_MENU_SHELL(menu), delete_item);
+                    g_signal_connect(rename_item, "activate",
+                        G_CALLBACK(on_rename_folder_activate), menu);
+                    g_signal_connect(delete_item, "activate",
+                        G_CALLBACK(on_delete_folder_activate), menu);
+                    gtk_widget_show_all(menu);
+                    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+                    gtk_tree_path_free(path);
+                    return TRUE;
+                }
+                g_free(folder);
+            }
+            gtk_tree_path_free(path);
+            return TRUE;
+        }
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(treeview);
+        if (gtk_tree_selection_path_is_selected(selection, path) &&
+            !(event->state & GDK_SHIFT_MASK)) {
+            capture_pending_drag_sources(treeview);
+        } else {
+            clear_pending_drag_sources();
+        }
         // Primerjamo, ali je stolpec za smeti (2. stolpec, indeks 1)
         GtkTreeViewColumn *trash_col = gtk_tree_view_get_column(treeview, 1);
         if (col == trash_col) {
@@ -183,8 +282,10 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
             GtkTreeIter iter;
             if (gtk_tree_model_get_iter(model, &iter, path)) {
                 gchar *title = NULL;
-                gtk_tree_model_get(model, &iter, 0, &title, -1);
-                if (title) {
+                gchar *display_title = NULL;
+                gint row_kind = ROW_NOTE;
+                gtk_tree_model_get(model, &iter, 2, &title, 0, &display_title, 3, &row_kind, -1);
+                if (title && row_kind == ROW_NOTE) {
                     /* Remember selected index before reloading notes, so we can restore
                      * selection after deleting a note. This ensures that deleting the
                      * currently selected note keeps the cursor at the same visual
@@ -218,7 +319,7 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
                             gtk_tree_path_free(cur_path);
                         }
                     }
-                    char *dmsg = g_strdup_printf("Delete note '%s'?", title);
+                    char *dmsg = g_strdup_printf("Delete note '%s'?", display_title ? display_title : title);
                     GtkWidget *dialog = gtk_dialog_new_with_buttons("Delete note",
                         GTK_WINDOW(main_window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
                         "Yes", GTK_RESPONSE_YES,
@@ -241,6 +342,7 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
                     int resp = gtk_dialog_run(GTK_DIALOG(dialog));
                     gtk_widget_destroy(dialog);
                     g_free(dmsg);
+                    g_free(display_title);
                     if (resp == GTK_RESPONSE_YES) {
                         if (app_delete_note(title)) {
                             // Reload notes
@@ -278,6 +380,10 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
                     }
                     g_free(title);
                 }
+                else {
+                    g_free(title);
+                    g_free(display_title);
+                }
             }
             gtk_tree_path_free(path);
             return TRUE;
@@ -285,6 +391,140 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
         gtk_tree_path_free(path);
     }
     return FALSE;
+}
+
+static gboolean on_tree_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
+    (void)user_data;
+    if ((event->state & GDK_CONTROL_MASK) &&
+        (event->keyval == GDK_KEY_a || event->keyval == GDK_KEY_A)) {
+        gtk_tree_selection_select_all(gtk_tree_view_get_selection(GTK_TREE_VIEW(widget)));
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void folder_text_cell_data_func(GtkTreeViewColumn *column, GtkCellRenderer *renderer,
+    GtkTreeModel *model, GtkTreeIter *iter, gpointer user_data) {
+    (void)column; (void)user_data;
+    gint row_kind = ROW_NOTE;
+    gtk_tree_model_get(model, iter, 3, &row_kind, -1);
+    if (row_kind == ROW_FOLDER) {
+        g_object_set(renderer, "foreground", "#76b7ff", "foreground-set", TRUE, NULL);
+    } else if (row_kind == ROW_PARENT) {
+        g_object_set(renderer, "foreground", "#aab4c3", "foreground-set", TRUE, NULL);
+    } else {
+        g_object_set(renderer, "foreground-set", FALSE, NULL);
+    }
+}
+
+static void append_drag_source_payload(GString *payload, const char *source, gint row_kind) {
+    if (!source || (row_kind != ROW_NOTE && row_kind != ROW_FOLDER)) return;
+    gchar *encoded = g_base64_encode((const guchar *)source, strlen(source));
+    g_string_append_printf(payload, "%d|%s\n", row_kind, encoded);
+    g_free(encoded);
+}
+
+static void on_drag_data_get(GtkWidget *widget, GdkDragContext *context,
+    GtkSelectionData *selection_data, guint info, guint time, gpointer user_data) {
+    (void)context; (void)info; (void)time; (void)user_data;
+    GString *payload = g_string_new(NULL);
+
+    if (pending_drag_sources) {
+        for (GList *item = pending_drag_sources; item; item = item->next) {
+            DragSource *source = item->data;
+            append_drag_source_payload(payload, source->path, source->kind);
+        }
+    } else {
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(widget));
+        GtkTreeModel *model = NULL;
+        GList *rows = gtk_tree_selection_get_selected_rows(selection, &model);
+        for (GList *item = rows; item; item = item->next) {
+            GtkTreeIter iter;
+            GtkTreePath *path = item->data;
+            if (gtk_tree_model_get_iter(model, &iter, path)) {
+                gchar *source = NULL;
+                gint row_kind = ROW_NOTE;
+                gtk_tree_model_get(model, &iter, 2, &source, 3, &row_kind, -1);
+                append_drag_source_payload(payload, source, row_kind);
+                g_free(source);
+            }
+            gtk_tree_path_free(path);
+        }
+        g_list_free(rows);
+    }
+    gtk_selection_data_set_text(selection_data, payload->str, payload->len);
+    g_string_free(payload, TRUE);
+}
+
+static void on_drag_end(GtkWidget *widget, GdkDragContext *context, gpointer user_data) {
+    (void)widget; (void)context; (void)user_data;
+    clear_pending_drag_sources();
+}
+
+static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context,
+    gint x, gint y, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data) {
+    (void)info; (void)user_data;
+    GtkTreeView *tree_view = GTK_TREE_VIEW(widget);
+    GtkTreePath *dest_path = NULL;
+    GtkTreeViewDropPosition drop_pos;
+    gboolean accepted = FALSE;
+    gint moved = 0;
+
+    if (!gtk_tree_view_get_dest_row_at_pos(tree_view, x, y, &dest_path, &drop_pos)) {
+        gtk_drag_finish(context, FALSE, FALSE, time);
+        return;
+    }
+
+    GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
+    GtkTreeIter dest_iter;
+    if (!gtk_tree_model_get_iter(model, &dest_iter, dest_path)) {
+        gtk_tree_path_free(dest_path);
+        gtk_drag_finish(context, FALSE, FALSE, time);
+        return;
+    }
+
+    gchar *destination = NULL;
+    gint destination_kind = ROW_NOTE;
+    gtk_tree_model_get(model, &dest_iter, 2, &destination, 3, &destination_kind, -1);
+    gtk_tree_path_free(dest_path);
+    if (!destination || (destination_kind != ROW_FOLDER && destination_kind != ROW_PARENT)) {
+        g_free(destination);
+        gtk_drag_finish(context, FALSE, FALSE, time);
+        return;
+    }
+
+    gchar *payload = (gchar *)gtk_selection_data_get_text(selection_data);
+    if (payload) {
+        gchar **lines = g_strsplit(payload, "\n", -1);
+        for (gint i = 0; lines[i]; ++i) {
+            if (!*lines[i]) continue;
+            gchar **parts = g_strsplit(lines[i], "|", 2);
+            if (parts[0] && parts[1]) {
+                gint row_kind = atoi(parts[0]);
+                gsize decoded_len = 0;
+                guchar *decoded = g_base64_decode(parts[1], &decoded_len);
+                if (decoded && (row_kind == ROW_NOTE || row_kind == ROW_FOLDER)) {
+                    accepted = TRUE;
+                    if (app_move_entry((const char *)decoded, destination,
+                        row_kind == ROW_FOLDER)) {
+                        moved++;
+                    }
+                }
+                g_free(decoded);
+            }
+            g_strfreev(parts);
+        }
+        g_strfreev(lines);
+        g_free(payload);
+    }
+    g_free(destination);
+
+    if (moved > 0) {
+        reload_folders();
+        reload_notes_safely(search_entry ? gtk_entry_get_text(GTK_ENTRY(search_entry)) : "");
+        select_last_or_first_note();
+    }
+    gtk_drag_finish(context, accepted && moved > 0, FALSE, time);
 }
 
 static gboolean editor_autosave_cb(gpointer user_data) {
@@ -320,22 +560,28 @@ static void editor_autosave(EditorData *ed) {
         desired_title = g_strdup_printf("untitled_%ld", (long)t);
     }
 
+    char *desired_path = (ed->folder && *ed->folder)
+        ? g_build_filename(ed->folder, desired_title, NULL) : g_strdup(desired_title);
+
     if (!ed->title) {
-        char *unique = g_strdup(desired_title);
+        char *unique = g_strdup(desired_path);
         int suffix = 1;
         while (note_file_exists(unique)) {
             g_free(unique);
-            unique = g_strdup_printf("%s-%d", desired_title, suffix++);
+            char *unique_name = g_strdup_printf("%s-%d", desired_title, suffix++);
+            unique = (ed->folder && *ed->folder)
+                ? g_build_filename(ed->folder, unique_name, NULL) : unique_name;
+            if (ed->folder && *ed->folder) g_free(unique_name);
         }
         ed->title = unique;
         if (last_selected_note) g_free(last_selected_note);
         last_selected_note = g_strdup(ed->title);
         reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
-    } else if (g_strcmp0(desired_title, ed->title) != 0) {
+    } else if (g_strcmp0(desired_path, ed->title) != 0) {
         /* Če cilj že obstaja, obdrži star naslov brez pop-upov med tipkanjem. */
-        if (!note_file_exists(desired_title) && app_rename_note(ed->title, desired_title)) {
+        if (!note_file_exists(desired_path) && app_rename_note(ed->title, desired_path)) {
             g_free(ed->title);
-            ed->title = g_strdup(desired_title);
+            ed->title = g_strdup(desired_path);
             if (last_selected_note) g_free(last_selected_note);
             last_selected_note = g_strdup(ed->title);
             reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
@@ -351,6 +597,7 @@ static void editor_autosave(EditorData *ed) {
     }
 
     if (first) g_free(first);
+    g_free(desired_path);
     g_free(desired_title);
     g_free(text);
 }
@@ -437,8 +684,20 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
     GtkTreeIter iter;
     if (!gtk_tree_model_get_iter(model, &iter, path)) return;
     gchar *title = NULL;
-    gtk_tree_model_get(model, &iter, 0, &title, -1);
-    if (!title) return;
+    gchar *display_title = NULL;
+    gint row_kind = ROW_NOTE;
+    gtk_tree_model_get(model, &iter, 2, &title, 0, &display_title, 3, &row_kind, -1);
+    if (!title) {
+        g_free(display_title);
+        return;
+    }
+
+    if (row_kind == ROW_FOLDER || row_kind == ROW_PARENT) {
+        navigate_to_folder(title);
+        g_free(display_title);
+        g_free(title);
+        return;
+    }
 
     /* Create buffer and load note content */
     GtkTextBuffer *buffer = gtk_text_buffer_new(NULL);
@@ -446,10 +705,11 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
 
     /* Create editor dialog with loaded content */
     char window_title[512];
-    snprintf(window_title, sizeof(window_title), "Edit: %s", title);
+    snprintf(window_title, sizeof(window_title), "Edit: %s", display_title ? display_title : title);
     GtkWidget *dlg = create_editor_dialog(window_title, title, buffer);
     
     gtk_widget_show_all(dlg);
+    g_free(display_title);
     g_free(title);
 }
 
@@ -460,6 +720,7 @@ static void editor_destroy(GtkWidget *w, gpointer user_data) {
     if (ed->autosave_timer) { g_source_remove(ed->autosave_timer); ed->autosave_timer = 0; }
     if (ed->dirty) editor_autosave(ed);
     if (ed->title) g_free(ed->title);
+    if (ed->folder) g_free(ed->folder);
     if (ed->fg_color) g_free(ed->fg_color);
     if (ed->bg_color) g_free(ed->bg_color);
     if (ed->undo_stack) g_list_free_full(ed->undo_stack, g_free);
@@ -598,6 +859,64 @@ static void on_underline_toggled(GtkToggleButton *btn, gpointer user_data) {
 
 /* ui_apply_color_on_selection removed (unused) */
 
+static char *find_color_at_iter(GtkTextIter iter, const char *prefix) {
+    for (int pass = 0; pass < 2; ++pass) {
+        GSList *tags = gtk_text_iter_get_tags(&iter);
+        char *found = NULL;
+        for (GSList *item = tags; item; item = item->next) {
+            GtkTextTag *tag = item->data;
+            const char *name = g_object_get_data(G_OBJECT(tag), "bn-tag-name");
+            if (name && g_str_has_prefix(name, prefix)) {
+                found = g_strdup_printf("#%s", name + strlen(prefix));
+                break;
+            }
+        }
+        g_slist_free(tags);
+        if (found) return found;
+        if (pass == 0 && gtk_text_iter_get_offset(&iter) > 0)
+            gtk_text_iter_backward_char(&iter);
+        else
+            break;
+    }
+    return NULL;
+}
+
+static void set_color_button_silently(GtkWidget *button, const char *color,
+    GCallback callback, EditorData *ed, const char *fallback) {
+    if (!button) return;
+    GdkRGBA rgba;
+    if (!color || !gdk_rgba_parse(&rgba, color))
+        gdk_rgba_parse(&rgba, fallback);
+    g_signal_handlers_block_by_func(button, callback, ed);
+    gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(button), &rgba);
+    g_signal_handlers_unblock_by_func(button, callback, ed);
+}
+
+static void editor_update_palette(EditorData *ed) {
+    if (!ed || !ed->buffer) return;
+    GtkTextIter iter;
+    GtkTextIter start, end;
+    if (gtk_text_buffer_get_selection_bounds(ed->buffer, &start, &end)) {
+        iter = start;
+    } else {
+        GtkTextMark *insert = gtk_text_buffer_get_insert(ed->buffer);
+        gtk_text_buffer_get_iter_at_mark(ed->buffer, &iter, insert);
+    }
+
+    char *fg = find_color_at_iter(iter, "FG:#");
+    char *bg = find_color_at_iter(iter, "BG:#");
+    set_color_button_silently(ed->fg_btn, fg, G_CALLBACK(on_fg_color_set), ed, "#000000");
+    set_color_button_silently(ed->bg_btn, bg, G_CALLBACK(on_bg_color_set), ed, "#ffffff");
+    g_free(fg);
+    g_free(bg);
+}
+
+static void on_buffer_mark_set(GtkTextBuffer *buffer, GtkTextIter *location,
+    GtkTextMark *mark, gpointer user_data) {
+    (void)buffer; (void)location; (void)mark;
+    editor_update_palette((EditorData *)user_data);
+}
+
 static void on_fg_color_set(GtkColorButton *cbtn, gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
     GdkRGBA color; gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(cbtn), &color);
@@ -686,6 +1005,7 @@ static void on_clear_formatting_clicked(GtkButton *btn, gpointer user_data) {
     }
     /* Return focus to editor */
     if (ed->tview) gtk_widget_grab_focus(ed->tview);
+    editor_update_palette(ed);
 }
 
 static void open_url_from_selection(EditorData *ed) {
@@ -829,11 +1149,13 @@ static GtkWidget *create_rich_toolbar_for_editor(EditorData *ed) {
     gtk_widget_set_tooltip_text(tb_fg, "Text color");
     g_signal_connect(tb_fg, "color-set", G_CALLBACK(on_fg_color_set), ed);
     gtk_box_pack_start(GTK_BOX(toolbar), tb_fg, FALSE, FALSE, 0);
+    ed->fg_btn = tb_fg;
     
     GtkWidget *tb_bg = gtk_color_button_new();
     gtk_widget_set_tooltip_text(tb_bg, "Background color");
     g_signal_connect(tb_bg, "color-set", G_CALLBACK(on_bg_color_set), ed);
     gtk_box_pack_start(GTK_BOX(toolbar), tb_bg, FALSE, FALSE, 0);
+    ed->bg_btn = tb_bg;
     
     /* Clear formatting button */
     GtkWidget *clear_fmt_btn = gtk_button_new_from_icon_name("edit-clear", GTK_ICON_SIZE_BUTTON);
@@ -910,8 +1232,9 @@ static void select_last_or_first_note(void) {
     if (last_selected_note && valid) {
         do {
             char *title = NULL;
-            gtk_tree_model_get(model, &iter, 0, &title, -1);
-            if (title) {
+            gint row_kind = ROW_NOTE;
+            gtk_tree_model_get(model, &iter, 2, &title, 3, &row_kind, -1);
+            if (title && row_kind == ROW_NOTE) {
                 if (g_strcmp0(title, last_selected_note) == 0) {
                     found_path = gtk_tree_model_get_path(model, &iter);
                     g_print("DEBUG: Found last note '%s' at path\n", title);
@@ -924,10 +1247,17 @@ static void select_last_or_first_note(void) {
     }
     
     if (!found_path) {
-        // Fallback to first
+        // Fallback to the first note, keeping folder rows unselected.
+        gint row_kind = ROW_FOLDER;
         if (gtk_tree_model_get_iter_first(model, &iter)) {
-            found_path = gtk_tree_model_get_path(model, &iter);
-            g_print("DEBUG: Fallback to first note\n");
+            do {
+                gtk_tree_model_get(model, &iter, 3, &row_kind, -1);
+                if (row_kind == ROW_NOTE) {
+                    found_path = gtk_tree_model_get_path(model, &iter);
+                    g_print("DEBUG: Fallback to first note\n");
+                    break;
+                }
+            } while (gtk_tree_model_iter_next(model, &iter));
         }
     }
     
@@ -1030,24 +1360,182 @@ static void on_search_changed(GtkEntry *entry, gpointer user_data) {
     reload_notes_safely(text);
 }
 
+static void reload_folders(void) {
+    if (!folder_combo) return;
+    g_signal_handlers_block_by_func(folder_combo, G_CALLBACK(on_folder_changed), NULL);
+    app_load_folders(GTK_COMBO_BOX_TEXT(folder_combo));
+    if (current_folder && *current_folder &&
+        gtk_combo_box_set_active_id(GTK_COMBO_BOX(folder_combo), current_folder)) {
+        g_signal_handlers_unblock_by_func(folder_combo, G_CALLBACK(on_folder_changed), NULL);
+        return;
+    }
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(folder_combo), "__root__");
+    g_signal_handlers_unblock_by_func(folder_combo, G_CALLBACK(on_folder_changed), NULL);
+}
+
+static void navigate_to_folder(const char *folder) {
+    if (!folder_combo) return;
+    if (folder && *folder)
+        gtk_combo_box_set_active_id(GTK_COMBO_BOX(folder_combo), folder);
+    else
+        gtk_combo_box_set_active_id(GTK_COMBO_BOX(folder_combo), "__root__");
+}
+
+static void on_folder_changed(GtkComboBox *combo, gpointer user_data) {
+    (void)user_data;
+    const char *id = gtk_combo_box_get_active_id(combo);
+    if (!id) return;
+    char *next_folder = g_strcmp0(id, "__root__") == 0 ? g_strdup("") : g_strdup(id);
+    if (g_strcmp0(next_folder, current_folder) == 0) {
+        g_free(next_folder);
+        return;
+    }
+    g_free(current_folder);
+    current_folder = next_folder;
+    if (last_selected_note) {
+        g_free(last_selected_note);
+        last_selected_note = NULL;
+    }
+    reload_notes_safely(search_entry ? gtk_entry_get_text(GTK_ENTRY(search_entry)) : "");
+    select_last_or_first_note();
+}
+
+static void on_new_folder_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn; (void)user_data;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "New folder", GTK_WINDOW(main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "Create", GTK_RESPONSE_OK, "Cancel", GTK_RESPONSE_CANCEL, NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "Folder name");
+    gtk_widget_set_margin_start(area, 14);
+    gtk_widget_set_margin_end(area, 14);
+    gtk_widget_set_margin_top(area, 12);
+    gtk_widget_set_margin_bottom(area, 12);
+    gtk_box_pack_start(GTK_BOX(area), entry, FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+    int response = gtk_dialog_run(GTK_DIALOG(dialog));
+    const char *name = gtk_entry_get_text(GTK_ENTRY(entry));
+    char *new_folder = NULL;
+    if (response == GTK_RESPONSE_OK && name && *name &&
+        app_create_folder(current_folder, name)) {
+        new_folder = (current_folder && *current_folder)
+            ? g_build_filename(current_folder, name, NULL) : g_strdup(name);
+    }
+    gtk_widget_destroy(dialog);
+    if (new_folder) {
+        reload_folders();
+        reload_notes_safely(search_entry ? gtk_entry_get_text(GTK_ENTRY(search_entry)) : "");
+        select_last_or_first_note();
+        g_free(new_folder);
+    } else if (response == GTK_RESPONSE_OK) {
+        GtkWidget *error = gtk_message_dialog_new(GTK_WINDOW(main_window),
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_OK, "Could not create folder. Check the name or whether it already exists.");
+        gtk_dialog_run(GTK_DIALOG(error));
+        gtk_widget_destroy(error);
+    }
+}
+
+static void refresh_folder_view(void) {
+    reload_folders();
+    reload_notes_safely(search_entry ? gtk_entry_get_text(GTK_ENTRY(search_entry)) : "");
+    select_last_or_first_note();
+}
+
+static void on_rename_folder_activate(GtkMenuItem *item, gpointer user_data) {
+    (void)item;
+    GtkWidget *menu = GTK_WIDGET(user_data);
+    const char *stored_folder = g_object_get_data(G_OBJECT(menu), "folder-path");
+    char *folder = g_strdup(stored_folder ? stored_folder : "");
+    char *old_name = g_path_get_basename(folder);
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Rename folder", GTK_WINDOW(main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "Rename", GTK_RESPONSE_OK, "Cancel", GTK_RESPONSE_CANCEL, NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(entry), old_name);
+    gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
+    gtk_widget_set_margin_start(area, 14);
+    gtk_widget_set_margin_end(area, 14);
+    gtk_widget_set_margin_top(area, 12);
+    gtk_widget_set_margin_bottom(area, 12);
+    gtk_box_pack_start(GTK_BOX(area), entry, FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+    int response = gtk_dialog_run(GTK_DIALOG(dialog));
+    char *new_name = NULL;
+    if (response == GTK_RESPONSE_OK)
+        new_name = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
+    gtk_widget_destroy(dialog);
+
+    if (new_name && !app_rename_folder(folder, new_name)) {
+        GtkWidget *error = gtk_message_dialog_new(GTK_WINDOW(main_window),
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_OK, "Could not rename the folder. The name may already exist or be invalid.");
+        gtk_dialog_run(GTK_DIALOG(error));
+        gtk_widget_destroy(error);
+    } else if (new_name) {
+        refresh_folder_view();
+    }
+    g_free(new_name);
+    g_free(old_name);
+    g_free(folder);
+    gtk_widget_destroy(menu);
+}
+
+static void on_delete_folder_activate(GtkMenuItem *item, gpointer user_data) {
+    (void)item;
+    GtkWidget *menu = GTK_WIDGET(user_data);
+    const char *stored_folder = g_object_get_data(G_OBJECT(menu), "folder-path");
+    char *folder = g_strdup(stored_folder ? stored_folder : "");
+    char *name = g_path_get_basename(folder);
+    int empty = app_folder_is_empty(folder);
+
+    if (empty < 0) {
+        GtkWidget *error = gtk_message_dialog_new(GTK_WINDOW(main_window),
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_OK, "Could not inspect the folder.");
+        gtk_dialog_run(GTK_DIALOG(error));
+        gtk_widget_destroy(error);
+    } else {
+        GtkWidget *dialog;
+        if (empty) {
+            dialog = gtk_message_dialog_new(GTK_WINDOW(main_window),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_QUESTION,
+                GTK_BUTTONS_NONE, "Delete empty folder '%s'?", name);
+        } else {
+            dialog = gtk_message_dialog_new(GTK_WINDOW(main_window),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_WARNING,
+                GTK_BUTTONS_NONE,
+                "Folder '%s' is not empty. Deleting it will permanently delete all notes and subfolders inside it. Continue?",
+                name);
+        }
+        gtk_dialog_add_button(GTK_DIALOG(dialog), "Delete", GTK_RESPONSE_YES);
+        gtk_dialog_add_button(GTK_DIALOG(dialog), "Cancel", GTK_RESPONSE_NO);
+        int response = gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        if (response == GTK_RESPONSE_YES && !app_delete_folder(folder)) {
+            GtkWidget *error = gtk_message_dialog_new(GTK_WINDOW(main_window),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK, "Could not delete the folder.");
+            gtk_dialog_run(GTK_DIALOG(error));
+            gtk_widget_destroy(error);
+        } else if (response == GTK_RESPONSE_YES) {
+            refresh_folder_view();
+        }
+    }
+    g_free(name);
+    g_free(folder);
+    gtk_widget_destroy(menu);
+}
+
 static void on_clear_clicked(GtkButton *btn, gpointer user_data) {
     gtk_entry_set_text(GTK_ENTRY(search_entry), "");
     reload_notes_safely("");
-        /* Select first note if it exists */
-    if (tree && notes_store) {
-        GtkTreeModel *model = GTK_TREE_MODEL(notes_store);
-        GtkTreeIter iter;
-        if (gtk_tree_model_get_iter_first(model, &iter)) {
-            GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
-            GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
-            gtk_tree_selection_select_path(sel, path);
-            gtk_tree_view_set_cursor(GTK_TREE_VIEW(tree), path, NULL, FALSE);
-            gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(tree), path, NULL, TRUE, 0.5, 0.0);
-            /* Give focus to the tree so keyboard navigation works */
-            gtk_widget_grab_focus(tree);
-            gtk_tree_path_free(path);
-        }
-    }
+    select_last_or_first_note();
 }
 
 // Helper: find the first non-empty line (trim) in text, returns a newly allocated string
@@ -1113,6 +1601,13 @@ static GtkWidget* create_editor_dialog(const char *window_title, const char *not
     
     EditorData *ed = g_new0(EditorData, 1);
     ed->title = note_title ? g_strdup(note_title) : NULL;
+    if (note_title) {
+        gchar *dirname = g_path_get_dirname(note_title);
+        ed->folder = (g_strcmp0(dirname, ".") == 0) ? g_strdup("") : g_strdup(dirname);
+        g_free(dirname);
+    } else {
+        ed->folder = g_strdup(current_folder ? current_folder : "");
+    }
     ed->buffer = buffer;
     ed->window = dlg;
     ed->tview = tview;
@@ -1127,6 +1622,8 @@ static GtkWidget* create_editor_dialog(const char *window_title, const char *not
 
     GtkWidget *toolbar = create_rich_toolbar_for_editor(ed);
     gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
+    g_signal_connect(ed->buffer, "mark-set", G_CALLBACK(on_buffer_mark_set), ed);
+    editor_update_palette(ed);
 
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
@@ -1203,6 +1700,18 @@ static GtkWidget* create_main_window(void) {
     gtk_style_context_add_class(gtk_widget_get_style_context(hbox), "topbar");
     gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
 
+    folder_combo = gtk_combo_box_text_new();
+    gtk_widget_set_size_request(folder_combo, 150, -1);
+    gtk_widget_set_tooltip_text(folder_combo, "Current folder");
+    g_signal_connect(folder_combo, "changed", G_CALLBACK(on_folder_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(hbox), folder_combo, FALSE, FALSE, 0);
+
+    GtkWidget *new_folder_btn = gtk_button_new_from_icon_name("folder-new", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(new_folder_btn, "New folder");
+    gtk_style_context_add_class(gtk_widget_get_style_context(new_folder_btn), "btn-flat");
+    g_signal_connect(new_folder_btn, "clicked", G_CALLBACK(on_new_folder_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(hbox), new_folder_btn, FALSE, FALSE, 0);
+
     search_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Search notes...");
     gtk_style_context_add_class(gtk_widget_get_style_context(search_entry), "search-entry");
@@ -1221,19 +1730,35 @@ static GtkWidget* create_main_window(void) {
     g_signal_connect(clear_btn, "clicked", G_CALLBACK(on_clear_clicked), NULL);
     gtk_box_pack_end(GTK_BOX(hbox), clear_btn, FALSE, FALSE, 0);
 
-    // Model: 0=title, 1=trash icon
-    notes_store = gtk_list_store_new(2, G_TYPE_STRING, GDK_TYPE_PIXBUF);
+    // Model: 0=display title, 1=folder/trash icon, 2=relative path, 3=row kind
+    notes_store = gtk_list_store_new(4, G_TYPE_STRING, GDK_TYPE_PIXBUF, G_TYPE_STRING, G_TYPE_INT);
     tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(notes_store));
     gtk_style_context_add_class(gtk_widget_get_style_context(tree), "notes-tree");
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), FALSE);
     gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(tree), FALSE);
     gtk_tree_view_set_activate_on_single_click(GTK_TREE_VIEW(tree), FALSE);
+    gtk_tree_view_set_reorderable(GTK_TREE_VIEW(tree), FALSE);
+    gtk_widget_add_events(tree, GDK_KEY_PRESS_MASK);
+    g_signal_connect(tree, "key-press-event", G_CALLBACK(on_tree_key_press), NULL);
+
+    GtkTargetEntry drag_targets[] = {
+        { "text/plain", GTK_TARGET_SAME_APP, 0 }
+    };
+    gtk_tree_view_enable_model_drag_source(GTK_TREE_VIEW(tree), GDK_BUTTON1_MASK,
+        drag_targets, 1, GDK_ACTION_MOVE);
+    gtk_tree_view_enable_model_drag_dest(GTK_TREE_VIEW(tree), drag_targets, 1,
+        GDK_ACTION_MOVE);
+    g_signal_connect(tree, "drag-data-get", G_CALLBACK(on_drag_data_get), NULL);
+    g_signal_connect(tree, "drag-end", G_CALLBACK(on_drag_end), NULL);
+    g_signal_connect(tree, "drag-data-received", G_CALLBACK(on_drag_data_received), NULL);
 
     // Title (expandable)
     GtkCellRenderer *renderer_text = gtk_cell_renderer_text_new();
     g_object_set(renderer_text, "ypad", 8, "xpad", 6, "size-points", 12.0, NULL);
     GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes("Note title", renderer_text, "text", 0, NULL);
     gtk_tree_view_column_set_expand(col, TRUE);
+    gtk_tree_view_column_set_cell_data_func(col, renderer_text,
+        folder_text_cell_data_func, NULL, NULL);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
 
     // Trash icon (fixed width, right)
@@ -1258,6 +1783,7 @@ static GtkWidget* create_main_window(void) {
 
     // Connect selection changed to save last note immediately
     GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+    gtk_tree_selection_set_mode(sel, GTK_SELECTION_MULTIPLE);
     g_signal_connect(sel, "changed", G_CALLBACK(on_selection_changed), NULL);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -1267,6 +1793,9 @@ static GtkWidget* create_main_window(void) {
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
 
     /* Make sure first row is selected when the main window appears */
+    if (!current_folder) current_folder = g_strdup("");
+    reload_folders();
+    reload_notes_safely("");
     select_last_or_first_note();
 
     return win;
