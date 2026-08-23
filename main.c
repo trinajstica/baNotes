@@ -166,19 +166,27 @@ static gboolean note_file_exists(const char *title) {
 
 // Handler: selection changed
 static void on_selection_changed(GtkTreeSelection *selection, gpointer data) {
-    GtkTreeModel *model;
-    GtkTreeIter iter;
-    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
-        gchar *title = NULL;
-        gint row_kind = ROW_NOTE;
-        gtk_tree_model_get(model, &iter, 2, &title, 3, &row_kind, -1);
-        if (title && row_kind == ROW_NOTE) {
-            // Save to RAM only
-            if (last_selected_note) g_free(last_selected_note);
-            last_selected_note = g_strdup(title);
+    (void)data;
+    GtkTreeModel *model = NULL;
+    GList *rows = gtk_tree_selection_get_selected_rows(selection, &model);
+    for (GList *item = rows; item; item = item->next) {
+        GtkTreePath *path = item->data;
+        GtkTreeIter iter;
+        if (gtk_tree_model_get_iter(model, &iter, path)) {
+            gchar *title = NULL;
+            gint row_kind = ROW_NOTE;
+            gtk_tree_model_get(model, &iter, 2, &title, 3, &row_kind, -1);
+            if (title && row_kind == ROW_NOTE) {
+                // Save the first selected note to RAM only.
+                g_free(last_selected_note);
+                last_selected_note = g_strdup(title);
+                g_free(title);
+                break;
+            }
             g_free(title);
         }
     }
+    g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
 }
 
 // Helper: reload notes while blocking selection signal to preserve last_selected_note
@@ -312,13 +320,13 @@ static gboolean on_tree_button_press(GtkWidget *widget, GdkEventButton *event, g
                         /* Fall back to current selection when clicked path is not available */
                         GtkTreeSelection *cur_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
                         GtkTreeModel *cur_model = NULL;
-                        GtkTreeIter cur_iter;
-                        if (gtk_tree_selection_get_selected(cur_sel, &cur_model, &cur_iter)) {
-                            GtkTreePath *cur_path = gtk_tree_model_get_path(cur_model, &cur_iter);
+                        GList *selected_rows = gtk_tree_selection_get_selected_rows(cur_sel, &cur_model);
+                        if (selected_rows) {
+                            GtkTreePath *cur_path = selected_rows->data;
                             const gint *indices = gtk_tree_path_get_indices(cur_path);
                             if (indices) saved_index = indices[0];
-                            gtk_tree_path_free(cur_path);
                         }
+                        g_list_free_full(selected_rows, (GDestroyNotify)gtk_tree_path_free);
                     }
                     char *dmsg = g_strdup_printf("Delete note '%s'?", display_title ? display_title : title);
                     GtkWidget *dialog = gtk_dialog_new_with_buttons("Delete note",
