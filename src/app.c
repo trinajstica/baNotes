@@ -80,12 +80,7 @@ GdkPixbuf *app_get_parent_icon(void) {
 static char *get_notes_dir(void) {
     const char *home = getenv("HOME");
     if (!home) return NULL;
-    static char path[4096];
-    gchar *tmp = g_build_filename(home, CONFIG_DIR, NOTES_SUBDIR, NULL);
-    strncpy(path, tmp, sizeof(path)-1);
-    path[sizeof(path)-1] = '\0';
-    g_free(tmp);
-    return path;
+    return g_build_filename(home, CONFIG_DIR, NOTES_SUBDIR, NULL);
 }
 
 /* All paths exposed to the UI are relative to the notes directory. */
@@ -110,16 +105,18 @@ static gchar *build_note_path(const char *title) {
     gchar *filename = (strlen(title) > 4 && strcmp(title + strlen(title) - 4, ".txt") == 0)
         ? g_strdup(title) : g_strconcat(title, ".txt", NULL);
     gchar *path = g_build_filename(notes_dir, filename, NULL);
+    g_free(notes_dir);
     g_free(filename);
     return path;
 }
 
 static gchar *build_folder_path(const char *folder) {
-    if (!folder || !*folder) return g_strdup(get_notes_dir());
+    if (!folder || !*folder) return get_notes_dir();
     if (!valid_relative_path(folder)) return NULL;
     char *notes_dir = get_notes_dir();
     if (!notes_dir) return NULL;
     gchar *path = g_build_filename(notes_dir, folder, NULL);
+    g_free(notes_dir);
     return path;
 }
 
@@ -404,7 +401,7 @@ char *app_serialize_buffer_rich(GtkTextBuffer *buffer) {
             if (!still) {
                 gpointer startp = g_hash_table_lookup(active, atag);
                 if (startp) {
-                    int start_off = GPOINTER_TO_INT(startp);
+                    int start_off = GPOINTER_TO_INT(startp) - 1;
                     const char *name = (const char*)g_object_get_data(G_OBJECT(atag), "bn-tag-name");
                     g_string_append_printf(out, "TAG|%s|%d|%d\n", name ? name : "", start_off, offset);
                 }
@@ -416,7 +413,9 @@ char *app_serialize_buffer_rich(GtkTextBuffer *buffer) {
             for (GSList *r = tags; r; r = r->next) {
             GtkTextTag *tt = (GtkTextTag*)r->data;
             if (!g_hash_table_contains(active, tt)) {
-                g_hash_table_insert(active, tt, GINT_TO_POINTER(offset));
+                /* Store offset + 1 because GINT_TO_POINTER(0) is NULL and
+                 * would make a tag beginning at the first character vanish. */
+                g_hash_table_insert(active, tt, GINT_TO_POINTER(offset + 1));
             }
         }
             if (!gtk_text_iter_forward_char(&it)) break;
@@ -428,7 +427,7 @@ char *app_serialize_buffer_rich(GtkTextBuffer *buffer) {
         GtkTextTag *atag = (GtkTextTag*)q->data;
         gpointer startp = g_hash_table_lookup(active, atag);
         if (startp) {
-            int start_off = GPOINTER_TO_INT(startp);
+            int start_off = GPOINTER_TO_INT(startp) - 1;
                 const char *name = (const char*)g_object_get_data(G_OBJECT(atag), "bn-tag-name");
             g_string_append_printf(out, "TAG|%s|%d|%d\n", name ? name : "", start_off, end_offset);
         }
@@ -484,7 +483,14 @@ struct note_entry {
 
 static int note_cmp(const void *a, const void *b) {
     const struct note_entry *na = a, *nb = b;
-    return (nb->mtime - na->mtime);
+    if (na->mtime < nb->mtime) return 1;
+    if (na->mtime > nb->mtime) return -1;
+    return 0;
+}
+
+static gboolean is_real_directory(const char *path) {
+    return path && g_file_test(path, G_FILE_TEST_IS_DIR) &&
+        !g_file_test(path, G_FILE_TEST_IS_SYMLINK);
 }
 
 static GList *get_child_folder_names(const char *parent_path) {
@@ -494,7 +500,7 @@ static GList *get_child_folder_names(const char *parent_path) {
     const gchar *name;
     while ((name = g_dir_read_name(dir))) {
         gchar *child_path = g_build_filename(parent_path, name, NULL);
-        if (g_file_test(child_path, G_FILE_TEST_IS_DIR))
+        if (is_real_directory(child_path))
             names = g_list_insert_sorted(names, g_strdup(name),
                 (GCompareFunc)g_ascii_strcasecmp);
         g_free(child_path);
@@ -559,7 +565,7 @@ static gboolean collect_search_results(struct search_context *ctx, const char *f
     const gchar *name;
     while ((name = g_dir_read_name(dir))) {
         gchar *child_path = g_build_filename(folder_path, name, NULL);
-        if (g_file_test(child_path, G_FILE_TEST_IS_DIR)) {
+        if (is_real_directory(child_path)) {
             gchar *child_folder = (folder && *folder)
                 ? g_build_filename(folder, name, NULL) : g_strdup(name);
             gboolean folder_name_matches = search_text_matches(name, ctx->query_folded);
@@ -578,8 +584,17 @@ static gboolean collect_search_results(struct search_context *ctx, const char *f
                 ? g_build_filename(folder, title, NULL) : g_strdup(title);
             gboolean title_matches = search_text_matches(relative, ctx->query_folded);
             if (title_matches || search_file_content_matches(child_path, ctx->query_folded)) {
-                ctx->notes = realloc(ctx->notes,
+                struct note_entry *new_notes = realloc(ctx->notes,
                     sizeof(*ctx->notes) * (ctx->note_count + 1));
+                if (!new_notes) {
+                    g_free(relative);
+                    g_free(title);
+                    g_free(child_path);
+                    g_dir_close(dir);
+                    g_free(folder_path);
+                    return FALSE;
+                }
+                ctx->notes = new_notes;
                 ctx->notes[ctx->note_count].filename = relative;
                 ctx->notes[ctx->note_count].mtime = get_file_mtime(child_path);
                 ctx->note_count++;
@@ -717,7 +732,7 @@ int app_rename_folder(const char *folder, const char *new_name) {
     gchar *source_path = build_folder_path(folder);
     gchar *target_path = build_folder_path(target);
     int result = source_path && target_path &&
-        g_file_test(source_path, G_FILE_TEST_IS_DIR) &&
+        is_real_directory(source_path) &&
         !g_file_test(target_path, G_FILE_TEST_EXISTS) &&
         rename(source_path, target_path) == 0;
     g_free(parent);
@@ -763,7 +778,7 @@ int app_delete_folder(const char *folder) {
     if (!folder || !*folder || !valid_relative_path(folder)) return 0;
     gchar *path = build_folder_path(folder);
     if (!path) return 0;
-    int result = g_file_test(path, G_FILE_TEST_IS_DIR) && delete_folder_contents(path);
+    int result = is_real_directory(path) && delete_folder_contents(path);
     g_free(path);
     return result;
 }
@@ -824,14 +839,22 @@ void app_load_notes(GtkListStore *store, const char *filter, const char *folder)
             g_free(entry_path);
             continue;
         }
-        char path[4096];
-        strncpy(path, entry_path, sizeof(path)-1);
-        path[sizeof(path)-1] = '\0';
-        g_free(entry_path);
-        FILE *f = fopen(path, "r");
-        if (!f) continue;
+        FILE *f = fopen(entry_path, "r");
+        if (!f) {
+            g_free(entry_path);
+            continue;
+        }
         fclose(f);
-        notes = realloc(notes, sizeof(*notes) * (count+1));
+        struct note_entry *new_notes = realloc(notes, sizeof(*notes) * (count+1));
+        if (!new_notes) {
+            g_free(entry_path);
+            for (size_t i = 0; i < count; ++i) free(notes[i].filename);
+            free(notes);
+            closedir(dir);
+            g_free(notes_dir);
+            return;
+        }
+        notes = new_notes;
         // Store name without .txt extension
         const char *dot = strrchr(entry->d_name, '.');
         size_t base_len = dot && strcmp(dot, ".txt") == 0 ? (size_t)(dot - entry->d_name) : strlen(entry->d_name);
@@ -839,8 +862,9 @@ void app_load_notes(GtkListStore *store, const char *filter, const char *folder)
         notes[count].filename = (folder && *folder)
             ? g_build_filename(folder, title, NULL) : g_strdup(title);
         free(title);
-        notes[count].mtime = get_file_mtime(path);
+        notes[count].mtime = get_file_mtime(entry_path);
         count++;
+        g_free(entry_path);
     }
     closedir(dir);
     if (count > 1) qsort(notes, count, sizeof(*notes), note_cmp);
@@ -948,7 +972,7 @@ int app_move_entry(const char *source, const char *destination_folder, gboolean 
 
     if (source_path && destination_path && destination_dir &&
         g_file_test(source_path, G_FILE_TEST_EXISTS) &&
-        g_file_test(destination_dir, G_FILE_TEST_IS_DIR) &&
+        is_real_directory(destination_dir) &&
         !g_file_test(destination_path, G_FILE_TEST_EXISTS) &&
         rename(source_path, destination_path) == 0) {
         result = 1;

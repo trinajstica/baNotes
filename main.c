@@ -1,5 +1,5 @@
 /* Application version — update here when releasing */
-#define VERZIJA "baNotes v1.02"
+#define VERZIJA "baNotes v1.03"
 
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
@@ -27,6 +27,7 @@ static int current_x = -1;
 static int current_y = -1;
 static char *last_selected_note = NULL;  // RAM-only: last selected note title
 static char *current_folder = NULL;      // relative folder path, empty means root
+static guint search_reload_timer = 0;
 
 typedef struct {
     char *path;
@@ -85,6 +86,7 @@ static int server_sock = -1;
 // Forward
 static void *instance_server_thread(void *arg);
 static gboolean bring_main_window(gpointer user_data);
+static gboolean reload_search_cb(gpointer user_data);
 
 
 static void cleanup_socket(void) {
@@ -127,6 +129,8 @@ struct EditorData {
     guint debounce_timer; /* timer id for grouping keypress snapshots */
     guint autosave_timer; /* timer id for autosave debounce */
     gboolean dirty;       /* buffer changed since last successful autosave */
+    GList *insert_idle_ids; /* pending tag-application callbacks */
+    gboolean destroying;
 };
 
 static char *sanitize_title(const char *s) {
@@ -469,6 +473,9 @@ static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context,
     GtkTreeViewDropPosition drop_pos;
     gboolean accepted = FALSE;
     gint moved = 0;
+    gint attempted = 0;
+    gint failed = 0;
+    GString *failed_sources = NULL;
 
     if (!gtk_tree_view_get_dest_row_at_pos(tree_view, x, y, &dest_path, &drop_pos)) {
         gtk_drag_finish(context, FALSE, FALSE, time);
@@ -492,6 +499,7 @@ static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context,
         gtk_drag_finish(context, FALSE, FALSE, time);
         return;
     }
+    failed_sources = g_string_new(NULL);
 
     gchar *payload = (gchar *)gtk_selection_data_get_text(selection_data);
     if (payload) {
@@ -505,9 +513,13 @@ static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context,
                 guchar *decoded = g_base64_decode(parts[1], &decoded_len);
                 if (decoded && (row_kind == ROW_NOTE || row_kind == ROW_FOLDER)) {
                     accepted = TRUE;
+                    attempted++;
                     if (app_move_entry((const char *)decoded, destination,
                         row_kind == ROW_FOLDER)) {
                         moved++;
+                    } else {
+                        failed++;
+                        g_string_append_printf(failed_sources, "%s\n", (const char *)decoded);
                     }
                 }
                 g_free(decoded);
@@ -525,6 +537,16 @@ static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context,
         select_last_or_first_note();
     }
     gtk_drag_finish(context, accepted && moved > 0, FALSE, time);
+    if (failed > 0) {
+        GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(main_window),
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_WARNING,
+            GTK_BUTTONS_OK,
+            "Moved %d of %d selected items. These could not be moved:\n%s",
+            moved, attempted, failed_sources->str);
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+    }
+    g_string_free(failed_sources, TRUE);
 }
 
 static gboolean editor_autosave_cb(gpointer user_data) {
@@ -542,6 +564,12 @@ static void editor_schedule_autosave(EditorData *ed) {
         ed->autosave_timer = 0;
     }
     ed->autosave_timer = g_timeout_add(300, editor_autosave_cb, ed);
+}
+
+static void editor_mark_dirty(EditorData *ed) {
+    if (!ed) return;
+    ed->dirty = TRUE;
+    editor_schedule_autosave(ed);
 }
 
 static void editor_autosave(EditorData *ed) {
@@ -591,8 +619,11 @@ static void editor_autosave(EditorData *ed) {
     if (ed->title) {
         char *ser = app_serialize_buffer_rich(ed->buffer);
         if (!ser) ser = g_strdup(text ? text : "");
-        app_write_note(ed->title, ser);
-        ed->dirty = FALSE;
+        if (app_write_note(ed->title, ser)) {
+            ed->dirty = FALSE;
+        } else {
+            g_printerr("baNotes: could not save note '%s'\n", ed->title);
+        }
         g_free(ser);
     }
 
@@ -716,9 +747,21 @@ static void on_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeV
 static void editor_destroy(GtkWidget *w, gpointer user_data) {
     EditorData *ed = (EditorData*)user_data;
     if (!ed) return;
+    ed->destroying = TRUE;
     if (ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
     if (ed->autosave_timer) { g_source_remove(ed->autosave_timer); ed->autosave_timer = 0; }
-    if (ed->dirty) editor_autosave(ed);
+    for (GList *item = ed->insert_idle_ids; item; item = item->next)
+        g_source_remove(GPOINTER_TO_UINT(item->data));
+    g_list_free(ed->insert_idle_ids);
+    ed->insert_idle_ids = NULL;
+    /* Always flush once on close.  This also covers buffer changes for which
+     * GTK did not emit the expected changed signal. */
+    editor_autosave(ed);
+    if (ed->buffer) {
+        g_signal_handlers_disconnect_by_func(ed->buffer, G_CALLBACK(on_insert_text), ed);
+        g_signal_handlers_disconnect_by_func(ed->buffer, G_CALLBACK(on_buffer_changed), ed);
+        g_signal_handlers_disconnect_by_func(ed->buffer, G_CALLBACK(on_buffer_mark_set), ed);
+    }
     if (ed->title) g_free(ed->title);
     if (ed->folder) g_free(ed->folder);
     if (ed->fg_color) g_free(ed->fg_color);
@@ -798,6 +841,7 @@ static void editor_apply_tag_on_selection(EditorData *ed, const char *tagname, g
     GtkTextTag *tag = ui_get_or_create_tag(buf, tagname);
     if (apply) gtk_text_buffer_apply_tag(buf, tag, &s, &e);
     else gtk_text_buffer_remove_tag(buf, tag, &s, &e);
+    editor_mark_dirty(ed);
 }
 
 static void on_bold_toggled(GtkToggleButton *btn, gpointer user_data) {
@@ -929,6 +973,7 @@ static void on_fg_color_set(GtkColorButton *cbtn, gpointer user_data) {
             editor_push_snapshot(ed);
             GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, name);
             gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e);
+            editor_mark_dirty(ed);
             /* do not persist color if selection was applied */
         } else {
             g_free(ed->fg_color); ed->fg_color = g_strdup(hex);
@@ -949,6 +994,7 @@ static void on_bg_color_set(GtkColorButton *cbtn, gpointer user_data) {
             editor_push_snapshot(ed);
             GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, name);
             gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e);
+            editor_mark_dirty(ed);
             /* do not persist color if selection was applied */
         } else {
             g_free(ed->bg_color); ed->bg_color = g_strdup(hex);
@@ -971,6 +1017,7 @@ static void on_clear_formatting_clicked(GtkButton *btn, gpointer user_data) {
             if (ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
             editor_push_snapshot(ed);
             gtk_text_buffer_remove_all_tags(ed->buffer, &s, &e);
+            editor_mark_dirty(ed);
         } else {
             gtk_text_buffer_get_start_iter(ed->buffer, &s);
             gtk_text_buffer_get_end_iter(ed->buffer, &e);
@@ -978,6 +1025,7 @@ static void on_clear_formatting_clicked(GtkButton *btn, gpointer user_data) {
                 if (ed->debounce_timer) { g_source_remove(ed->debounce_timer); ed->debounce_timer = 0; }
                 editor_push_snapshot(ed);
                 gtk_text_buffer_remove_all_tags(ed->buffer, &s, &e);
+                editor_mark_dirty(ed);
             }
         }
     }
@@ -1075,20 +1123,25 @@ typedef struct {
     EditorData *ed;
     int start;
     int len;
+    guint source_id;
 } InsertCtx;
 
 static gboolean apply_tags_to_range_idle(gpointer user_data) {
     InsertCtx *ctx = (InsertCtx*)user_data;
-    if (!ctx || !ctx->ed || !ctx->ed->buffer) { g_free(ctx); return FALSE; }
+    if (!ctx) return G_SOURCE_REMOVE;
+    EditorData *ed = ctx->ed;
+    if (ed) ed->insert_idle_ids = g_list_remove(ed->insert_idle_ids,
+        GUINT_TO_POINTER(ctx->source_id));
+    if (!ed || ed->destroying || !ed->buffer) { g_free(ctx); return G_SOURCE_REMOVE; }
     GtkTextIter s, e;
-    gtk_text_buffer_get_iter_at_offset(ctx->ed->buffer, &s, ctx->start);
-    gtk_text_buffer_get_iter_at_offset(ctx->ed->buffer, &e, ctx->start + ctx->len);
+    gtk_text_buffer_get_iter_at_offset(ed->buffer, &s, ctx->start);
+    gtk_text_buffer_get_iter_at_offset(ed->buffer, &e, ctx->start + ctx->len);
     /* apply tags according to editor flags */
-    if (ctx->ed->bold_mode) { GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, "BOLD"); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
-    if (ctx->ed->italic_mode) { GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, "ITALIC"); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
-    if (ctx->ed->underline_mode) { GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, "UNDERLINE"); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
-    if (ctx->ed->fg_color) { char name[64]; snprintf(name, sizeof(name), "FG:%s", ctx->ed->fg_color); /* our real format uses FG:#rrggbb - ensure prefix */ snprintf(name, sizeof(name), "FG:%s", ctx->ed->fg_color); GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, name); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
-    if (ctx->ed->bg_color) { char name[64]; snprintf(name, sizeof(name), "BG:%s", ctx->ed->bg_color); GtkTextTag *tag = ui_get_or_create_tag(ctx->ed->buffer, name); gtk_text_buffer_apply_tag(ctx->ed->buffer, tag, &s, &e); }
+    if (ed->bold_mode) { GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, "BOLD"); gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e); }
+    if (ed->italic_mode) { GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, "ITALIC"); gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e); }
+    if (ed->underline_mode) { GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, "UNDERLINE"); gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e); }
+    if (ed->fg_color) { char name[64]; snprintf(name, sizeof(name), "FG:%s", ed->fg_color); GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, name); gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e); }
+    if (ed->bg_color) { char name[64]; snprintf(name, sizeof(name), "BG:%s", ed->bg_color); GtkTextTag *tag = ui_get_or_create_tag(ed->buffer, name); gtk_text_buffer_apply_tag(ed->buffer, tag, &s, &e); }
     g_free(ctx);
     return FALSE;
 }
@@ -1104,7 +1157,9 @@ static void on_insert_text(GtkTextBuffer *buffer, GtkTextIter *location, gchar *
     ctx->start = start;
     ctx->len = len;
     /* Schedule to run after insertion is done (in main loop) */
-    g_idle_add(apply_tags_to_range_idle, ctx);
+    ctx->source_id = g_idle_add(apply_tags_to_range_idle, ctx);
+    ed->insert_idle_ids = g_list_prepend(ed->insert_idle_ids,
+        GUINT_TO_POINTER(ctx->source_id));
 }
 
 static void on_buffer_changed(GtkTextBuffer *buffer, gpointer user_data) {
@@ -1356,8 +1411,20 @@ static void on_quit(GtkMenuItem *item, gpointer user_data) {
 }
 
 static void on_search_changed(GtkEntry *entry, gpointer user_data) {
-    const char *text = gtk_entry_get_text(entry);
-    reload_notes_safely(text);
+    (void)entry; (void)user_data;
+    if (search_reload_timer) {
+        g_source_remove(search_reload_timer);
+        search_reload_timer = 0;
+    }
+    search_reload_timer = g_timeout_add(180, reload_search_cb, NULL);
+}
+
+static gboolean reload_search_cb(gpointer user_data) {
+    (void)user_data;
+    search_reload_timer = 0;
+    if (search_entry)
+        reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
+    return G_SOURCE_REMOVE;
 }
 
 static void reload_folders(void) {
@@ -1383,6 +1450,10 @@ static void navigate_to_folder(const char *folder) {
 
 static void on_folder_changed(GtkComboBox *combo, gpointer user_data) {
     (void)user_data;
+    if (search_reload_timer) {
+        g_source_remove(search_reload_timer);
+        search_reload_timer = 0;
+    }
     const char *id = gtk_combo_box_get_active_id(combo);
     if (!id) return;
     char *next_folder = g_strcmp0(id, "__root__") == 0 ? g_strdup("") : g_strdup(id);
@@ -1533,6 +1604,11 @@ static void on_delete_folder_activate(GtkMenuItem *item, gpointer user_data) {
 }
 
 static void on_clear_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn; (void)user_data;
+    if (search_reload_timer) {
+        g_source_remove(search_reload_timer);
+        search_reload_timer = 0;
+    }
     gtk_entry_set_text(GTK_ENTRY(search_entry), "");
     reload_notes_safely("");
     select_last_or_first_note();
@@ -1902,7 +1978,8 @@ int main(int argc, char *argv[]) {
             addr.sun_family = AF_UNIX;
             strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
             if (connect(cli, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-                // Another instance is running — exit silently without showing anything
+                // Another instance is running — ask it to show the main window.
+                (void)write(cli, "SHOW", 4);
                 close(cli);
                 return 0;
             }
