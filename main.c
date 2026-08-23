@@ -173,14 +173,11 @@ static void on_selection_changed(GtkTreeSelection *selection, gpointer data) {
         gint row_kind = ROW_NOTE;
         gtk_tree_model_get(model, &iter, 2, &title, 3, &row_kind, -1);
         if (title && row_kind == ROW_NOTE) {
-            g_print("DEBUG: on_selection_changed: saving '%s' to RAM\n", title);
             // Save to RAM only
             if (last_selected_note) g_free(last_selected_note);
             last_selected_note = g_strdup(title);
             g_free(title);
         }
-    } else {
-        g_print("DEBUG: on_selection_changed: no selection\n");
     }
 }
 
@@ -1276,9 +1273,6 @@ static gboolean on_wrap_label_button_press(GtkWidget *widget, GdkEventButton *ev
 static void select_last_or_first_note(void) {
     if (!tree || !notes_store) return;
     
-    g_print("DEBUG: select_last_or_first_note: last_selected_note='%s'\n", 
-            last_selected_note ? last_selected_note : "(null)");
-    
     GtkTreeModel *model = GTK_TREE_MODEL(notes_store);
     GtkTreeIter iter;
     gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
@@ -1292,7 +1286,6 @@ static void select_last_or_first_note(void) {
             if (title && row_kind == ROW_NOTE) {
                 if (g_strcmp0(title, last_selected_note) == 0) {
                     found_path = gtk_tree_model_get_path(model, &iter);
-                    g_print("DEBUG: Found last note '%s' at path\n", title);
                     g_free(title);
                     break;
                 }
@@ -1309,7 +1302,6 @@ static void select_last_or_first_note(void) {
                 gtk_tree_model_get(model, &iter, 3, &row_kind, -1);
                 if (row_kind == ROW_NOTE) {
                     found_path = gtk_tree_model_get_path(model, &iter);
-                    g_print("DEBUG: Fallback to first note\n");
                     break;
                 }
             } while (gtk_tree_model_iter_next(model, &iter));
@@ -1333,7 +1325,6 @@ static void select_last_or_first_note(void) {
         
         // Give focus to the tree view
         gtk_widget_grab_focus(tree);
-        g_print("DEBUG: Selection complete, focus set to tree\n");
     }
 }
 
