@@ -576,6 +576,12 @@ static gboolean collect_search_results(struct search_context *ctx, const char *f
             }
             g_free(child_folder);
         } else if (g_file_test(child_path, G_FILE_TEST_IS_REGULAR)) {
+            /* Dot-prefixed files are temporary/internal notes (for example
+             * .untitled_<timestamp>) and must not appear in search results. */
+            if (name[0] == '.') {
+                g_free(child_path);
+                continue;
+            }
             const char *dot = strrchr(name, '.');
             size_t base_len = dot && strcmp(dot, ".txt") == 0
                 ? (size_t)(dot - name) : strlen(name);
@@ -836,6 +842,12 @@ void app_load_notes(GtkListStore *store, const char *filter, const char *folder)
     while ((entry = readdir(dir))) {
         gchar *entry_path = g_build_filename(notes_dir, entry->d_name, NULL);
         if (!g_file_test(entry_path, G_FILE_TEST_IS_REGULAR)) {
+            g_free(entry_path);
+            continue;
+        }
+        /* New notes are stored as hidden .untitled_* files until they get
+         * their first real title. */
+        if (entry->d_name[0] == '.') {
             g_free(entry_path);
             continue;
         }

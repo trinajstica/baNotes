@@ -109,6 +109,7 @@ typedef struct EditorData EditorData;
 struct EditorData {
     char *title; // brez .txt
     char *folder; // relative folder for a newly created note
+    gboolean is_new_note;
     GtkTextBuffer *buffer;
     GtkWidget *window;
     GtkWidget *tview;
@@ -162,6 +163,22 @@ static char *sanitize_title(const char *s) {
 
 static gboolean note_file_exists(const char *title) {
     return title && app_note_exists(title);
+}
+
+/* Temporary names for new notes stay hidden from the notes list until the
+ * user enters actual content and the note receives its real title. */
+static char *make_temporary_note_title(const char *folder) {
+    time_t now = time(NULL);
+    for (int suffix = 0; ; ++suffix) {
+        gchar *name = suffix == 0
+            ? g_strdup_printf(".untitled_%ld", (long)now)
+            : g_strdup_printf(".untitled_%ld-%d", (long)now, suffix);
+        gchar *candidate = (folder && *folder)
+            ? g_build_filename(folder, name, NULL) : g_strdup(name);
+        g_free(name);
+        if (!note_file_exists(candidate)) return candidate;
+        g_free(candidate);
+    }
 }
 
 // Handler: selection changed
@@ -586,6 +603,16 @@ static void editor_autosave(EditorData *ed) {
     gchar *text = gtk_text_buffer_get_text(ed->buffer, &start, &end, FALSE);
     char *first = first_nonempty_line(text);
 
+    /* An untouched new note is only a temporary hidden file.  Keep it while
+     * the editor is open, but remove it when the user closes the editor. */
+    if (ed->is_new_note && (!first || !*first)) {
+        if (ed->destroying && ed->title && note_file_exists(ed->title))
+            app_delete_note(ed->title);
+        g_free(first);
+        g_free(text);
+        return;
+    }
+
     char *desired_title = NULL;
     if (first && *first) desired_title = sanitize_title(first);
     else {
@@ -596,7 +623,7 @@ static void editor_autosave(EditorData *ed) {
     char *desired_path = (ed->folder && *ed->folder)
         ? g_build_filename(ed->folder, desired_title, NULL) : g_strdup(desired_title);
 
-    if (!ed->title) {
+    if (ed->is_new_note) {
         char *unique = g_strdup(desired_path);
         int suffix = 1;
         while (note_file_exists(unique)) {
@@ -606,10 +633,15 @@ static void editor_autosave(EditorData *ed) {
                 ? g_build_filename(ed->folder, unique_name, NULL) : unique_name;
             if (ed->folder && *ed->folder) g_free(unique_name);
         }
-        ed->title = unique;
-        if (last_selected_note) g_free(last_selected_note);
-        last_selected_note = g_strdup(ed->title);
-        reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
+        if (app_rename_note(ed->title, unique)) {
+            g_free(ed->title);
+            ed->title = unique;
+            ed->is_new_note = FALSE;
+            if (last_selected_note) g_free(last_selected_note);
+            last_selected_note = g_strdup(ed->title);
+        } else {
+            g_free(unique);
+        }
     } else if (g_strcmp0(desired_path, ed->title) != 0) {
         /* Če cilj že obstaja, obdrži star naslov brez pop-upov med tipkanjem. */
         if (!note_file_exists(desired_path) && app_rename_note(ed->title, desired_path)) {
@@ -617,7 +649,6 @@ static void editor_autosave(EditorData *ed) {
             ed->title = g_strdup(desired_path);
             if (last_selected_note) g_free(last_selected_note);
             last_selected_note = g_strdup(ed->title);
-            reload_notes_safely(gtk_entry_get_text(GTK_ENTRY(search_entry)));
         }
     }
 
@@ -626,6 +657,9 @@ static void editor_autosave(EditorData *ed) {
         if (!ser) ser = g_strdup(text ? text : "");
         if (app_write_note(ed->title, ser)) {
             ed->dirty = FALSE;
+            /* Osveži šele po zapisu, sicer se nova nota pri prvem
+             * osveževanju še ne more pojaviti v seznamu. */
+            reload_notes_safely(search_entry ? gtk_entry_get_text(GTK_ENTRY(search_entry)) : "");
         } else {
             g_printerr("baNotes: could not save note '%s'\n", ed->title);
         }
@@ -1675,7 +1709,6 @@ static GtkWidget* create_editor_dialog(const char *window_title, const char *not
     }
     
     EditorData *ed = g_new0(EditorData, 1);
-    ed->title = note_title ? g_strdup(note_title) : NULL;
     if (note_title) {
         gchar *dirname = g_path_get_dirname(note_title);
         ed->folder = (g_strcmp0(dirname, ".") == 0) ? g_strdup("") : g_strdup(dirname);
@@ -1683,6 +1716,8 @@ static GtkWidget* create_editor_dialog(const char *window_title, const char *not
     } else {
         ed->folder = g_strdup(current_folder ? current_folder : "");
     }
+    ed->is_new_note = note_title == NULL;
+    ed->title = note_title ? g_strdup(note_title) : make_temporary_note_title(ed->folder);
     ed->buffer = buffer;
     ed->window = dlg;
     ed->tview = tview;
@@ -1693,6 +1728,8 @@ static GtkWidget* create_editor_dialog(const char *window_title, const char *not
     ed->autosave_timer = 0;
     ed->dirty = FALSE;
     g_object_set_data(G_OBJECT(dlg), "editor-data", ed);
+    if (ed->is_new_note)
+        app_write_note(ed->title, "");
     editor_push_snapshot(ed);
 
     GtkWidget *toolbar = create_rich_toolbar_for_editor(ed);
@@ -1851,6 +1888,17 @@ static GtkWidget* create_main_window(void) {
     gtk_tree_view_column_set_fixed_width(col_trash, 56);
     gtk_tree_view_column_set_alignment(col_trash, 1.0);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col_trash);
+
+    /* Keep a small fixed inset on the far right.  This prevents the delete
+     * icon from sitting underneath an overlay scrollbar or the tree border
+     * when the window is resized, while the title column remains expandable. */
+    GtkTreeViewColumn *col_right_inset = gtk_tree_view_column_new();
+    GtkCellRenderer *renderer_right_inset = gtk_cell_renderer_text_new();
+    g_object_set(renderer_right_inset, "text", "", "xpad", 0, "ypad", 0, NULL);
+    gtk_tree_view_column_pack_start(col_right_inset, renderer_right_inset, FALSE);
+    gtk_tree_view_column_set_sizing(col_right_inset, GTK_TREE_VIEW_COLUMN_FIXED);
+    gtk_tree_view_column_set_fixed_width(col_right_inset, 12);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col_right_inset);
 
     // Connect click on cell (only for trash) and double-click (row-activated) for editing
     g_signal_connect(tree, "button-press-event", G_CALLBACK(on_tree_button_press), NULL);
