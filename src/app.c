@@ -682,32 +682,6 @@ static void load_search_results(GtkListStore *store, const char *filter, const c
     g_free(query_folded);
 }
 
-static void append_folder_options(GtkComboBoxText *combo, const char *parent, int depth) {
-    gchar *parent_path = build_folder_path(parent);
-    if (!parent_path) return;
-    GList *names = get_child_folder_names(parent_path);
-    for (GList *item = names; item; item = item->next) {
-        const char *child_name = item->data;
-        gchar *relative = (parent && *parent)
-            ? g_build_filename(parent, child_name, NULL) : g_strdup(child_name);
-        gchar *display = g_strdup_printf("%*s%s", depth * 2, "", child_name);
-        gtk_combo_box_text_append(combo, relative, display);
-        append_folder_options(combo, relative, depth + 1);
-        g_free(display);
-        g_free(relative);
-    }
-    g_list_free_full(names, g_free);
-    g_free(parent_path);
-}
-
-void app_load_folders(GtkComboBoxText *combo) {
-    if (!combo) return;
-    gtk_combo_box_text_remove_all(combo);
-    gtk_combo_box_text_append(combo, "__root__", "All notes");
-    append_folder_options(combo, "", 1);
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(combo), "__root__");
-}
-
 int app_create_folder(const char *parent, const char *name) {
     if (!name || !*name || strchr(name, '/') || strchr(name, '\\') ||
         g_strcmp0(name, ".") == 0 || g_strcmp0(name, "..") == 0) return 0;

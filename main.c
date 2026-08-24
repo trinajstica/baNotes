@@ -19,7 +19,6 @@
 static GtkWidget *main_window = NULL;
 static GtkWidget *search_entry = NULL;
 static GtkWidget *clear_btn = NULL;
-static GtkWidget *folder_combo = NULL;
 static GtkListStore *notes_store = NULL;
 static GtkWidget *tree = NULL;
 static AppIndicator *indicator = NULL;
@@ -47,7 +46,6 @@ static void on_quit(GtkMenuItem *item, gpointer user_data);
 static void on_show_hide(GtkMenuItem *item, gpointer user_data);
 static void on_search_changed(GtkEntry *entry, gpointer user_data);
 static void on_clear_clicked(GtkButton *btn, gpointer user_data);
-static void on_folder_changed(GtkComboBox *combo, gpointer user_data);
 static void on_new_folder_clicked(GtkButton *btn, gpointer user_data);
 static gboolean on_tree_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data);
 static void on_drag_data_get(GtkWidget *widget, GdkDragContext *context,
@@ -97,7 +95,6 @@ static void cleanup_socket(void) {
 static void editor_autosave(EditorData *ed);
 static char *first_nonempty_line(const char *text);
 static GtkWidget* create_editor_dialog(const char *window_title, const char *note_title, GtkTextBuffer *existing_buffer);
-static void reload_folders(void);
 static void select_last_or_first_note(void);
 static void navigate_to_folder(const char *folder);
 static void folder_text_cell_data_func(GtkTreeViewColumn *column, GtkCellRenderer *renderer,
@@ -555,7 +552,6 @@ static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context,
     g_free(destination);
 
     if (moved > 0) {
-        reload_folders();
         reload_notes_safely(search_entry ? gtk_entry_get_text(GTK_ENTRY(search_entry)) : "");
         select_last_or_first_note();
     }
@@ -1461,39 +1457,15 @@ static gboolean reload_search_cb(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
-static void reload_folders(void) {
-    if (!folder_combo) return;
-    g_signal_handlers_block_by_func(folder_combo, G_CALLBACK(on_folder_changed), NULL);
-    app_load_folders(GTK_COMBO_BOX_TEXT(folder_combo));
-    if (current_folder && *current_folder &&
-        gtk_combo_box_set_active_id(GTK_COMBO_BOX(folder_combo), current_folder)) {
-        g_signal_handlers_unblock_by_func(folder_combo, G_CALLBACK(on_folder_changed), NULL);
-        return;
-    }
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(folder_combo), "__root__");
-    g_signal_handlers_unblock_by_func(folder_combo, G_CALLBACK(on_folder_changed), NULL);
-}
-
 static void navigate_to_folder(const char *folder) {
-    if (!folder_combo) return;
-    if (folder && *folder)
-        gtk_combo_box_set_active_id(GTK_COMBO_BOX(folder_combo), folder);
-    else
-        gtk_combo_box_set_active_id(GTK_COMBO_BOX(folder_combo), "__root__");
-}
-
-static void on_folder_changed(GtkComboBox *combo, gpointer user_data) {
-    (void)user_data;
-    if (search_reload_timer) {
-        g_source_remove(search_reload_timer);
-        search_reload_timer = 0;
-    }
-    const char *id = gtk_combo_box_get_active_id(combo);
-    if (!id) return;
-    char *next_folder = g_strcmp0(id, "__root__") == 0 ? g_strdup("") : g_strdup(id);
+    char *next_folder = folder && *folder ? g_strdup(folder) : g_strdup("");
     if (g_strcmp0(next_folder, current_folder) == 0) {
         g_free(next_folder);
         return;
+    }
+    if (search_reload_timer) {
+        g_source_remove(search_reload_timer);
+        search_reload_timer = 0;
     }
     g_free(current_folder);
     current_folder = next_folder;
@@ -1530,7 +1502,6 @@ static void on_new_folder_clicked(GtkButton *btn, gpointer user_data) {
     }
     gtk_widget_destroy(dialog);
     if (new_folder) {
-        reload_folders();
         reload_notes_safely(search_entry ? gtk_entry_get_text(GTK_ENTRY(search_entry)) : "");
         select_last_or_first_note();
         g_free(new_folder);
@@ -1544,7 +1515,6 @@ static void on_new_folder_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 static void refresh_folder_view(void) {
-    reload_folders();
     reload_notes_safely(search_entry ? gtk_entry_get_text(GTK_ENTRY(search_entry)) : "");
     select_last_or_first_note();
 }
@@ -1844,12 +1814,6 @@ static GtkWidget* create_main_window(void) {
     gtk_style_context_add_class(gtk_widget_get_style_context(hbox), "topbar");
     gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
 
-    folder_combo = gtk_combo_box_text_new();
-    gtk_widget_set_size_request(folder_combo, 150, -1);
-    gtk_widget_set_tooltip_text(folder_combo, "Current folder");
-    g_signal_connect(folder_combo, "changed", G_CALLBACK(on_folder_changed), NULL);
-    gtk_box_pack_start(GTK_BOX(hbox), folder_combo, FALSE, FALSE, 0);
-
     GtkWidget *new_folder_btn = gtk_button_new_from_icon_name("folder-new", GTK_ICON_SIZE_BUTTON);
     gtk_widget_set_tooltip_text(new_folder_btn, "New folder");
     gtk_style_context_add_class(gtk_widget_get_style_context(new_folder_btn), "btn-flat");
@@ -1964,7 +1928,6 @@ static GtkWidget* create_main_window(void) {
 
     /* Make sure first row is selected when the main window appears */
     if (!current_folder) current_folder = g_strdup("");
-    reload_folders();
     reload_notes_safely("");
     select_last_or_first_note();
 

@@ -8,7 +8,6 @@
 #define NOTES_SUBDIR "notes"
 
 void app_init_config_dirs(void);
-void app_load_folders(GtkComboBoxText *combo);
 int app_create_folder(const char *parent, const char *name);
 int app_rename_folder(const char *folder, const char *new_name);
 int app_folder_is_empty(const char *folder);
