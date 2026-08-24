@@ -1,5 +1,5 @@
 /* Application version — update here when releasing */
-#define VERZIJA "baNotes v1.03"
+#define VERZIJA "baNotes v1.04"
 
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
@@ -59,6 +59,7 @@ static void on_rename_folder_activate(GtkMenuItem *item, gpointer user_data);
 static void on_delete_folder_activate(GtkMenuItem *item, gpointer user_data);
 static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data);
 static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data);
+static gboolean on_window_enter_notify(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data);
 static void show_main_window(void);
 static GtkWidget* create_main_window(void);
 static void create_tray_icon(void);
@@ -1791,11 +1792,42 @@ static gboolean on_window_focus_in(GtkWidget *widget, GdkEventFocus *event, gpoi
     return FALSE; /* propagate event */
 }
 
+static gboolean on_window_enter_notify(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data) {
+    (void)user_data;
+
+    /* After resizing, some window managers leave the resize cursor on the
+     * application GdkWindow.  An inherited/NULL cursor is not enough on all
+     * window managers, so explicitly install the normal pointer here. */
+    GdkDisplay *display = gtk_widget_get_display(widget);
+    GdkCursor *normal_cursor = display
+        ? gdk_cursor_new_from_name(display, "default") : NULL;
+    if (!normal_cursor && display)
+        normal_cursor = gdk_cursor_new_from_name(display, "left_ptr");
+
+    GdkWindow *window = event && event->window
+        ? event->window : gtk_widget_get_window(widget);
+    if (window && normal_cursor) gdk_window_set_cursor(window, normal_cursor);
+
+    /* Depending on the window hierarchy, the crossing event can arrive for
+     * a child GdkWindow.  Clear the toplevel as well, since the stale cursor
+     * may have been inherited from there. */
+    GdkWindow *toplevel = gtk_widget_get_window(widget);
+    if (toplevel && toplevel != window && normal_cursor)
+        gdk_window_set_cursor(toplevel, normal_cursor);
+
+    if (normal_cursor) g_object_unref(normal_cursor);
+    if (display) gdk_display_flush(display);
+
+    return FALSE;
+}
+
 static GtkWidget* create_main_window(void) {
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), "baNotes");
     gtk_window_set_default_size(GTK_WINDOW(win), 500, 600);
     gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_NONE);
+    gtk_widget_add_events(win, GDK_ENTER_NOTIFY_MASK);
+    g_signal_connect(win, "enter-notify-event", G_CALLBACK(on_window_enter_notify), NULL);
     g_signal_connect(win, "configure-event", G_CALLBACK(on_configure_event), NULL);
     g_signal_connect(win, "delete-event", G_CALLBACK(on_window_delete), NULL);
     g_signal_connect(win, "focus-in-event", G_CALLBACK(on_window_focus_in), NULL);
@@ -1866,8 +1898,18 @@ static GtkWidget* create_main_window(void) {
 
     // Title (expandable)
     GtkCellRenderer *renderer_text = gtk_cell_renderer_text_new();
-    g_object_set(renderer_text, "ypad", 8, "xpad", 6, "size-points", 12.0, NULL);
+    /* The title column must be allowed to shrink with the window.  Without an
+     * ellipsize mode GTK uses the full natural width of a long title when it
+     * measures the tree, which can push the fixed trash column out of view. */
+    g_object_set(renderer_text,
+        "ypad", 8,
+        "xpad", 6,
+        "size-points", 12.0,
+        "ellipsize", PANGO_ELLIPSIZE_END,
+        "max-width-chars", 1,
+        NULL);
     GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes("Note title", renderer_text, "text", 0, NULL);
+    gtk_tree_view_column_set_min_width(col, 1);
     gtk_tree_view_column_set_expand(col, TRUE);
     gtk_tree_view_column_set_cell_data_func(col, renderer_text,
         folder_text_cell_data_func, NULL, NULL);
@@ -1912,6 +1954,11 @@ static GtkWidget* create_main_window(void) {
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_style_context_add_class(gtk_widget_get_style_context(scroll), "notes-scroll");
     gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(scroll), GTK_SHADOW_NONE);
+    /* Keep the tree the width of the viewport.  Long titles are rendered with
+     * an ellipsis instead of creating a horizontal scrollbar that hides the
+     * fixed delete column. */
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(scroll), tree);
     gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
 
